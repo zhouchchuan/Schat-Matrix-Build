@@ -18,9 +18,13 @@ def replace(root, relative_path, replacements):
     path.write_text(content, encoding="utf-8", newline="\n")
 
 
-def configure_ios(root):
-    patch = Path(__file__).with_name("ios-call-audio.patch").resolve()
+def apply_patch(root, filename):
+    patch = Path(__file__).with_name(filename).resolve()
     subprocess.run(["git", "-C", str(root), "apply", str(patch)], check=True)
+
+
+def configure_ios(root):
+    apply_patch(root, "ios-call-audio.patch")
     replace(root, "app.yml", [
         ("APP_DISPLAY_NAME: Element X", "APP_DISPLAY_NAME: Schat Matrix"),
         ("APP_GROUP_IDENTIFIER: group.io.element", "APP_GROUP_IDENTIFIER: group.win.play800.schat.matrix"),
@@ -34,6 +38,7 @@ def configure_ios(root):
 
 
 def configure_android(root):
+    apply_patch(root, "android-call-audio.patch")
     replace(root, "plugins/src/main/kotlin/config/BuildTimeConfig.kt", [
         ('APPLICATION_ID = "io.element.android.x"', 'APPLICATION_ID = "win.play800.schat.matrix"'),
         ('APPLICATION_NAME = "Element X"', 'APPLICATION_NAME = "Schat Matrix"'),
