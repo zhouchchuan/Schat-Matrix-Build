@@ -1,0 +1,166 @@
+--- a/ElementX/Sources/Screens/CallScreen/CallScreenViewModel.swift
++++ b/ElementX/Sources/Screens/CallScreen/CallScreenViewModel.swift
+@@ -29,6 +29,19 @@
+     
+     @CancellableTask
+     private var timeoutTask: Task<Void, Never>?
++    private var hasSpeakerOverride = false
++    private var hasPreparedVoiceOutput = false
++    private var reportedAudioOutput: String?
++
++    private struct AudioOutput: Encodable {
++        static let speaker = Self(id: "built-in-speaker", name: "Speaker", isSpeaker: true)
++        static let receiver = Self(id: "built-in-receiver", name: "Receiver", isEarpiece: true)
++
++        let id: String
++        let name: String
++        var isEarpiece = false
++        var isSpeaker = false
++    }
+     
+     init(userSession: UserSessionProtocol,
+          configuration: ElementCallConfiguration,
+@@ -88,6 +101,8 @@
+         case .urlChanged(let url):
+             guard let url else { return }
+             MXLog.info("URL changed to: \(url)")
++            reportedAudioOutput = nil
++            Task { await updateOutputsListOnWeb() }
+         case .pictureInPictureIsAvailable(let controller):
+             actionsSubject.send(.pictureInPictureIsAvailable(controller))
+         case .navigateBack:
+@@ -111,6 +126,10 @@
+         }
+         
+         elementCallService.tearDownCallSession(roomID: configuration.callRoomID)
++        if hasSpeakerOverride {
++            try? AVAudioSession.sharedInstance().overrideOutputAudioPort(.none)
++            hasSpeakerOverride = false
++        }
+         UIDevice.current.isProximityMonitoringEnabled = false
+     }
+     
+@@ -186,13 +205,35 @@
+         }
+     }
+     
+-    /// This should always match the web app value
+-    private static let earpieceID = "earpiece-id"
+-    
+     private func handleOutputDeviceSelected(deviceID: String) {
+-        let isEarpiece = deviceID == Self.earpieceID
+-        MXLog.info("Is earpiece: \(isEarpiece)")
+-        UIDevice.current.isProximityMonitoringEnabled = isEarpiece
++        let session = AVAudioSession.sharedInstance()
++        guard session.category == .playAndRecord,
++              let current = session.currentRoute.outputs.first,
++              current.portType == .builtInSpeaker || current.portType == .builtInReceiver else { return }
++
++        do {
++            switch deviceID {
++            case AudioOutput.speaker.id:
++                guard current.portType != .builtInSpeaker else { return }
++                try session.overrideOutputAudioPort(.speaker)
++                hasSpeakerOverride = true
++            case AudioOutput.receiver.id:
++                guard current.portType != .builtInReceiver else { return }
++                if session.categoryOptions.contains(.defaultToSpeaker) || session.mode == .videoChat {
++                    try session.setCategory(.playAndRecord,
++                                            mode: .voiceChat,
++                                            options: session.categoryOptions.subtracting(.defaultToSpeaker))
++                }
++                try session.overrideOutputAudioPort(.none)
++                hasSpeakerOverride = false
++            default:
++                break
++            }
++        } catch {
++            MXLog.error("Unable to change call audio output: \(error)")
++            reportedAudioOutput = nil
++            Task { await updateOutputsListOnWeb() }
++        }
+     }
+     
+     private func handleBackwardsNavigation() async {
+@@ -246,29 +287,50 @@
+         }
+     }
+     
+-    /// This function updates the list of available audio outputs on the web side
+-    /// however since we actually handle switching the audio output through the OS,
+-    /// this is only used to inform the webview when the speaker is selected,
+-    /// so that the option to use the earpiece can be displayed.
+     private func updateOutputsListOnWeb() async {
+-        guard let currentOutput = AVAudioSession.sharedInstance().currentRoute.outputs.first else {
+-            return
+-        }
+-        
+-        let deviceList = if currentOutput.portType == .builtInSpeaker {
+-            // This allows the webview to display the earpiece option
+-            "{id: '\(currentOutput.uid)', name: '\(currentOutput.portName)', forEarpiece: true, isSpeaker: true}"
+-        } else {
+-            // Doesn't matter because the switch is handled through the OS
+-            "{id: 'dummy', name: 'dummy'}"
+-        }
+-        
+-        let javaScript = "window.controls.setAvailableOutputDevices([\(deviceList)])"
++        let session = AVAudioSession.sharedInstance()
++        guard let evaluate = state.bindings.javaScriptEvaluator else { return }
++
++        if configuration.voiceOnly, !hasPreparedVoiceOutput, session.category == .playAndRecord {
++            // Keep an attached headset. The built-in speaker makes the call's
++            // ringing tone audible and remains selectable during the call.
++            hasPreparedVoiceOutput = true
++            if session.currentRoute.outputs.first?.portType == .builtInReceiver {
++                do {
++                    try session.overrideOutputAudioPort(.speaker)
++                    hasSpeakerOverride = true
++                } catch {
++                    MXLog.debug("Unable to select the speaker for the call: \(error)")
++                }
++            }
++        }
++
++        guard let currentOutput = session.currentRoute.outputs.first else { return }
++        let outputs: [AudioOutput] = switch currentOutput.portType {
++        case .builtInSpeaker:
++            UIDevice.current.userInterfaceIdiom == .phone ? [.speaker, .receiver] : [.speaker]
++        case .builtInReceiver:
++            [.receiver, .speaker]
++        default:
++            [.init(id: currentOutput.uid, name: currentOutput.portName)]
++        }
++        guard let selected = outputs.first else { return }
++        UIDevice.current.isProximityMonitoringEnabled = selected.isEarpiece
++        guard reportedAudioOutput != selected.id else { return }
++
++        // Report the native selection before publishing the list, so Element Call
++        // does not replace a system route with its virtual earpiece.
+         do {
+-            let result = try await state.bindings.javaScriptEvaluator?(javaScript)
+-            MXLog.debug("Evaluated  with result: \(String(describing: result))")
++            let encoder = JSONEncoder()
++            let devicesJSON = String(decoding: try encoder.encode(outputs), as: UTF8.self)
++            let selectionJSON = String(decoding: try encoder.encode(selected.id), as: UTF8.self)
++            _ = try await evaluate("""
++            window.controls.setOutputDevice(\(selectionJSON));
++            window.controls.setAvailableOutputDevices(\(devicesJSON));
++            """)
++            reportedAudioOutput = selected.id
+         } catch {
+-            MXLog.error("Received javascript evaluation error: \(error)")
++            MXLog.debug("Unable to sync call audio outputs: \(error)")
+         }
+     }
+ }
+--- a/ElementX/Sources/Screens/CallScreen/View/CallScreen.swift
++++ b/ElementX/Sources/Screens/CallScreen/View/CallScreen.swift
+@@ -116,6 +116,7 @@
+             configuration.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
+             configuration.userContentController = userContentController
+             configuration.allowsInlineMediaPlayback = true
++            configuration.mediaTypesRequiringUserActionForPlayback = []
+             configuration.allowsPictureInPictureMediaPlayback = true
+             
+             let appName = InfoPlistReader.main.bundleDisplayName
+
