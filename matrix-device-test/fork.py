@@ -1,6 +1,7 @@
 """Set Schat test identities and the default Matrix homeserver."""
 
 import argparse
+import subprocess
 from pathlib import Path
 
 SERVER_NAME = "voice.800play.win:5289"
@@ -18,6 +19,8 @@ def replace(root, relative_path, replacements):
 
 
 def configure_ios(root):
+    patch = Path(__file__).with_name("ios-call-audio.patch").resolve()
+    subprocess.run(["git", "-C", str(root), "apply", str(patch)], check=True)
     replace(root, "app.yml", [
         ("APP_DISPLAY_NAME: Element X", "APP_DISPLAY_NAME: Schat Matrix"),
         ("APP_GROUP_IDENTIFIER: group.io.element", "APP_GROUP_IDENTIFIER: group.win.play800.schat.matrix"),
