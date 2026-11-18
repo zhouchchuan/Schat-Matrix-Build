@@ -21,7 +21,7 @@ if __name__ == "__main__":
     apply(args.app, "hd-ios-app.patch")
     apply(args.native, "hd-ios-native.patch")
     replace(args.app, "project.yml", [
-        ("CURRENT_PROJECT_VERSION: 4", "CURRENT_PROJECT_VERSION: 5"),
+        ("CURRENT_PROJECT_VERSION: 4", "CURRENT_PROJECT_VERSION: 6"),
         ("    url: https://github.com/element-hq/element-call-ios # Native implementation\n"
          "    exactVersion: 0.1.0-rc.16\n"
          "    # path: ../element-call-ios",
@@ -33,4 +33,3 @@ if __name__ == "__main__":
          '        .package(path: "../matrix-rust-rtc"),'),
         ('swift-snapshot-testing", exact: "1.19.4"', 'swift-snapshot-testing", exact: "1.19.7"'),
     ])
-
