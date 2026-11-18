@@ -1,0 +1,91 @@
+name: Build Schat Matrix devices
+
+on:
+  push:
+    branches: [main, elementx/device-test]
+    paths: [.github/workflows/elementx-device-test.yml, matrix-device-test/fork.py]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: schat-matrix-device-test
+  cancel-in-progress: true
+
+jobs:
+  ios:
+    runs-on: xcode-27
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: element-hq/element-x-ios
+          ref: 631ec73e088da90ac91b453a3ef3541c8c1dff18
+          persist-credentials: false
+          lfs: true
+          path: matrix-ios
+      - name: Configure the iPhone build
+        run: |
+          python3 matrix-device-test/fork.py ios matrix-ios
+          brew list --versions xcodegen || brew install xcodegen
+          xcodebuild -version
+          cd matrix-ios
+          xcodegen
+      - name: Compile iPhone app and package unsigned IPA
+        working-directory: matrix-ios
+        run: |
+          set -o pipefail
+          xcodebuild -project ElementX.xcodeproj -scheme ElementX -configuration Release \
+            -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/schat-build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build | tee "$RUNNER_TEMP/xcodebuild.log" | xcbeautify
+          app="$RUNNER_TEMP/schat-build/Build/Products/Release-iphoneos/ElementX.app"
+          test -f "$app/ElementX"
+          plutil -extract CFBundleIdentifier raw "$app/Info.plist" | grep -Fx win.play800.schat.matrix
+          mkdir -p "$RUNNER_TEMP/package/Payload"
+          ditto "$app" "$RUNNER_TEMP/package/Payload/ElementX.app"
+          cd "$RUNNER_TEMP/package"
+          zip -qry "$RUNNER_TEMP/Schat-Matrix-iOS-26.11.2-unsigned.ipa" Payload
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: Schat-Matrix-iOS-unsigned
+          path: ${{ runner.temp }}/Schat-Matrix-iOS-26.11.2-unsigned.ipa
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: failure()
+        with:
+          name: iOS-build-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: element-hq/element-x-android
+          ref: 5d1af53a6c8dd6234cbb51e44282d5902b6d4ff3
+          persist-credentials: false
+          lfs: true
+          path: matrix-android
+      - uses: ./matrix-android/.github/actions/setup-build
+        with:
+          gradle-cache-read-only: 'false'
+      - name: Configure and build the Android package
+        run: |
+          python3 matrix-device-test/fork.py android matrix-android
+          sdkmanager 'platforms;android-37.0' 'build-tools;36.0.0' 'build-tools;37.0.0'
+          cd matrix-android
+          ./gradlew :app:assembleFdroidRelease --stacktrace --no-configuration-cache
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: Schat-Matrix-Android-unsigned
+          path: matrix-android/app/build/outputs/apk/fdroid/release/*-universal-*-unsigned.apk
+          if-no-files-found: error
