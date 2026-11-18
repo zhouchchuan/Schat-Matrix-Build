@@ -1,4 +1,4 @@
-name: Package Schat HD calls for iPhone
+name: Package Schat room calls for iPhone
 
 on:
   workflow_dispatch:
@@ -70,15 +70,15 @@ jobs:
           app="$RUNNER_TEMP/schat-hd-build/Build/Products/Release-iphoneos/ElementX.app"
           test -f "$app/ElementX"
           plutil -extract CFBundleIdentifier raw "$app/Info.plist" | grep -Fx win.play800.schat.matrix
-          plutil -extract CFBundleVersion raw "$app/Info.plist" | grep -Fx 5
+          plutil -extract CFBundleVersion raw "$app/Info.plist" | grep -Fx 6
           mkdir -p "$RUNNER_TEMP/hd-package/Payload"
           ditto "$app" "$RUNNER_TEMP/hd-package/Payload/ElementX.app"
           cd "$RUNNER_TEMP/hd-package"
-          zip -qry "$RUNNER_TEMP/Schat-Matrix-iOS-26.11.2-build5-hd-call-unsigned.ipa" Payload
+          zip -qry "$RUNNER_TEMP/Schat-Matrix-iOS-26.11.2-build6-room-call-unsigned.ipa" Payload
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: Schat-HD-Call-iOS-unsigned
-          path: ${{ runner.temp }}/Schat-Matrix-iOS-26.11.2-build5-hd-call-unsigned.ipa
+          path: ${{ runner.temp }}/Schat-Matrix-iOS-26.11.2-build6-room-call-unsigned.ipa
           if-no-files-found: error
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: failure()
@@ -86,4 +86,3 @@ jobs:
           name: Schat-HD-Call-iOS-build-log
           path: ${{ runner.temp }}/xcodebuild.log
           if-no-files-found: ignore
-
