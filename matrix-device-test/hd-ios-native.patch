@@ -1,0 +1,484 @@
+--- a/Sources/ElementCallKit/Media/AudioFormat.swift
++++ b/Sources/ElementCallKit/Media/AudioFormat.swift
+@@ -7,13 +7,13 @@
+ 
+ import AVFoundation
+ 
+-/// 48 kHz mono 10 ms frames: what the RTC stack works in internally, so nothing has to resample,
+-/// and the usual WebRTC tick.
++/// 48 kHz interleaved stereo in 10 ms frames for the RTC transport.
+ nonisolated enum AudioFormat {
+     static let sampleRate = 48000
+-    static let channelCount = 1
++    static let channelCount = 2
+     static let samplesPerFrame = 480
+-    static let bytesPerFrame = samplesPerFrame * MemoryLayout<Int16>.size
++    static let samplesPerPacket = samplesPerFrame * channelCount
++    static let bytesPerFrame = samplesPerPacket * MemoryLayout<Int16>.size
+     
+     /// The interleaved Int16 format frames cross the FFI in.
+     static let pcm16 = AVAudioFormat(commonFormat: .pcmFormatInt16,
+@@ -24,8 +24,13 @@
+     /// The Float32 format the engine's mixer prefers for source nodes.
+     static let float32 = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                        sampleRate: Double(sampleRate),
+-                                       channels: AVAudioChannelCount(channelCount),
++                                       channels: 1,
+                                        interleaved: false)!
++
++    static let stereoFloat32 = AVAudioFormat(commonFormat: .pcmFormatFloat32,
++                                             sampleRate: Double(sampleRate),
++                                             channels: AVAudioChannelCount(channelCount),
++                                             interleaved: false)!
+ }
+ 
+ /// RMS level of a PCM16 buffer, 0...1.
+--- a/Sources/ElementCallKit/Media/MicrophoneTap.swift
++++ b/Sources/ElementCallKit/Media/MicrophoneTap.swift
+@@ -25,6 +25,7 @@
+     
+     private let ring: PCMRingBuffer
+     private let format: InputFormatSnapshot
++    private let channelCount: Int
+     private let scratch: UnsafeMutableBufferPointer<Int16>
+     private let isStopped = Atomic<Bool>(false)
+     
+@@ -32,10 +33,11 @@
+     /// locks, so the render path can never log its own anomalies.
+     let oversizedCallbacks = Atomic<Int>(0)
+     
+-    init(ring: PCMRingBuffer, format: InputFormatSnapshot) {
++    init(ring: PCMRingBuffer, format: InputFormatSnapshot, channelCount: Int = 1) {
+         self.ring = ring
+         self.format = format
+-        scratch = .allocate(capacity: Self.scratchCapacity)
++        self.channelCount = channelCount
++        scratch = .allocate(capacity: Self.scratchCapacity * channelCount)
+         scratch.initialize(repeating: 0)
+     }
+     
+@@ -73,6 +75,10 @@
+         guard format.sampleRate > 0 else { return noErr }
+         
+         let floats = data.assumingMemoryBound(to: Float.self)
++        let stride = format.isInterleaved ? max(1, Int(first.mNumberChannels)) : 1
++        let right = !format.isInterleaved && buffers.count > 1
++            ? buffers[1].mData?.assumingMemoryBound(to: Float.self)
++            : nil
+         let total = Int(frameCount)
+         if total > Self.scratchCapacity {
+             oversizedCallbacks.wrappingAdd(1, ordering: .relaxed)
+@@ -83,16 +89,20 @@
+             let chunk = min(Self.scratchCapacity, total - offset)
+             for index in 0..<chunk {
+                 let source = offset + index
+-                // Hardware input is Float32; take channel 0 when it is stereo.
+-                let sample = format.isInterleaved ? floats[source * format.channelCount] : floats[source]
+-                // Clamp order matters: `min(1, .nan)` yields 1 in Swift, so a NaN sample saturates
+-                // instead of trapping `Int16.init` on the IO thread. Rewriting this as a
+-                // `clamped(to:)` helper would reintroduce that trap.
+-                scratch[index] = Int16(max(-1, min(1, sample)) * Float(Int16.max))
++                let left = floats[source * stride]
++                scratch[index * channelCount] = Self.quantized(left)
++                if channelCount == 2 {
++                    let second = stride > 1 ? floats[source * stride + 1] : right?[source] ?? left
++                    scratch[index * channelCount + 1] = Self.quantized(second)
++                }
+             }
+-            ring.write(UnsafeBufferPointer(UnsafeMutableBufferPointer(rebasing: scratch[0..<chunk])))
++            ring.write(UnsafeBufferPointer(UnsafeMutableBufferPointer(rebasing: scratch[0..<(chunk * channelCount)])))
+             offset += chunk
+         }
+         return noErr
+     }
++
++    private static func quantized(_ sample: Float) -> Int16 {
++        Int16(max(-1, min(1, sample)) * Float(Int16.max))
++    }
+ }
+--- a/Sources/ElementCallKit/Media/MicrophoneCapturer.swift
++++ b/Sources/ElementCallKit/Media/MicrophoneCapturer.swift
+@@ -16,7 +16,7 @@
+ /// the capture stay up so unmuting is instant.
+ final nonisolated class MicrophoneCapturer: @unchecked Sendable {
+     private let engine: CallAudioEngine
+-    private let ring = PCMRingBuffer(capacity: AudioFormat.samplesPerFrame * 50)
++    private let ring = PCMRingBuffer(capacity: AudioFormat.samplesPerPacket * 50)
+     private let isMuted = Atomic<Bool>(false)
+     private let onLevel: @Sendable (MatrixRTCAudioLevel) -> Void
+     
+@@ -34,7 +34,7 @@
+     init(engine: CallAudioEngine, onLevel: @escaping @Sendable (MatrixRTCAudioLevel) -> Void) {
+         self.engine = engine
+         self.onLevel = onLevel
+-        tap = MicrophoneTap(ring: ring, format: engine.inputFormat)
++        tap = MicrophoneTap(ring: ring, format: engine.inputFormat, channelCount: AudioFormat.channelCount)
+     }
+     
+     func start(track: FfiLocalTrack) {
+@@ -91,9 +91,9 @@
+             chunk.withUnsafeMutableBufferPointer { ring.read(into: $0) }
+             pending += resampleToTarget(chunk)
+             
+-            while pending.count >= AudioFormat.samplesPerFrame {
+-                var samples = Array(pending.prefix(AudioFormat.samplesPerFrame))
+-                pending.removeFirst(AudioFormat.samplesPerFrame)
++            while pending.count >= AudioFormat.samplesPerPacket {
++                let samples = Array(pending.prefix(AudioFormat.samplesPerPacket))
++                pending.removeFirst(AudioFormat.samplesPerPacket)
+                 
+                 // Meter before the mute check: knowing the microphone is alive while muted is exactly
+                 // the question a silent call raises.
+@@ -144,14 +144,20 @@
+         let inputRate = engine.inputFormat.value.sampleRate
+         guard inputRate > 0, Int(inputRate) != AudioFormat.sampleRate else { return samples }
+         let ratio = inputRate / Double(AudioFormat.sampleRate)
+-        let outputCount = Int(Double(samples.count) / ratio)
+-        var output = [Int16](repeating: 0, count: outputCount)
+-        for index in 0..<outputCount {
++        let channels = AudioFormat.channelCount
++        let inputFrames = samples.count / channels
++        let outputFrames = Int(Double(inputFrames) / ratio)
++        var output = [Int16](repeating: 0, count: outputFrames * channels)
++        for index in 0..<outputFrames {
+             let position = Double(index) * ratio
+             let lower = Int(position)
+-            let upper = min(lower + 1, samples.count - 1)
++            let upper = min(lower + 1, inputFrames - 1)
+             let fraction = Float(position - Double(lower))
+-            output[index] = Int16(Float(samples[lower]) * (1 - fraction) + Float(samples[upper]) * fraction)
++            for channel in 0..<channels {
++                let a = Float(samples[lower * channels + channel])
++                let b = Float(samples[upper * channels + channel])
++                output[index * channels + channel] = Int16(a * (1 - fraction) + b * fraction)
++            }
+         }
+         return output
+     }
+--- a/Sources/ElementCallKit/Media/AudioPlaybackSink.swift
++++ b/Sources/ElementCallKit/Media/AudioPlaybackSink.swift
+@@ -15,7 +15,7 @@
+ final nonisolated class AudioPlaybackSink: @unchecked Sendable {
+     let memberID: String
+     private let engine: CallAudioEngine
+-    private let ring = PCMRingBuffer(capacity: AudioFormat.samplesPerFrame * 20)
++    private let ring = PCMRingBuffer(capacity: AudioFormat.samplesPerPacket * 20)
+     private let renderer: AudioPlaybackRenderer
+     private let frameCount = Atomic<UInt64>(0)
+     
+@@ -26,7 +26,7 @@
+         self.memberID = memberID
+         self.engine = engine
+         self.onLevel = onLevel
+-        renderer = AudioPlaybackRenderer(ring: ring, prefill: AudioFormat.samplesPerFrame * 3)
++        renderer = AudioPlaybackRenderer(ring: ring, prefill: AudioFormat.samplesPerPacket * 3, channelCount: AudioFormat.channelCount)
+     }
+     
+     func start(stream: AudioFrameStream) {
+--- a/Sources/ElementCallKit/Media/AudioPlaybackRenderer.swift
++++ b/Sources/ElementCallKit/Media/AudioPlaybackRenderer.swift
+@@ -22,16 +22,18 @@
+     private let ring: PCMRingBuffer
+     /// How much has to be buffered before playback starts, so the first under-run is not immediate.
+     private let prefill: Int
++    private let channelCount: Int
+     private let scratch: UnsafeMutableBufferPointer<Int16>
+     
+     private let isPrimed = Atomic<Bool>(false)
+     private let isDetached = Atomic<Bool>(false)
+     let underruns = Atomic<Int>(0)
+     
+-    init(ring: PCMRingBuffer, prefill: Int) {
++    init(ring: PCMRingBuffer, prefill: Int, channelCount: Int = 1) {
+         self.ring = ring
+         self.prefill = prefill
+-        scratch = .allocate(capacity: Self.scratchCapacity)
++        self.channelCount = channelCount
++        scratch = .allocate(capacity: Self.scratchCapacity * channelCount)
+         scratch.initialize(repeating: 0)
+     }
+     
+@@ -56,13 +58,16 @@
+     /// Runs on the real-time thread: no allocation, no locks, no engine.
+     func render(frameCount: AVAudioFrameCount, audioBufferList: UnsafeMutablePointer<AudioBufferList>) -> OSStatus {
+         let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+-        guard let first = buffers.first, let data = first.mData else { return noErr }
+-        let floats = data.assumingMemoryBound(to: Float.self)
++        let outputChannels = min(channelCount, buffers.count)
+         let total = Int(frameCount)
+         
+         if isDetached.load(ordering: .relaxed) || (!isPrimed.load(ordering: .relaxed) && ring.availableToRead < prefill) {
+-            for index in 0..<total {
+-                floats[index] = 0
++            for channel in 0..<outputChannels {
++                guard let data = buffers[channel].mData else { continue }
++                let samples = data.assumingMemoryBound(to: Float.self)
++                for index in 0..<total {
++                    samples[index] = 0
++                }
+             }
+             return noErr
+         }
+@@ -71,16 +76,20 @@
+         var offset = 0
+         while offset < total {
+             let chunk = min(Self.scratchCapacity, total - offset)
+-            let slice = UnsafeMutableBufferPointer(rebasing: scratch[0..<chunk])
++            let slice = UnsafeMutableBufferPointer(rebasing: scratch[0..<(chunk * channelCount)])
+             let real = ring.read(into: slice)
+-            if real < chunk {
++            if real < slice.count {
+                 underruns.wrappingAdd(1, ordering: .relaxed)
+                 if real == 0 {
+                     isPrimed.store(false, ordering: .relaxed)
+                 }
+             }
+-            for index in 0..<chunk {
+-                floats[offset + index] = Float(scratch[index]) / Float(Int16.max)
++            for channel in 0..<outputChannels {
++                guard let data = buffers[channel].mData else { continue }
++                let samples = data.assumingMemoryBound(to: Float.self)
++                for index in 0..<chunk {
++                    samples[offset + index] = Float(scratch[index * channelCount + channel]) / Float(Int16.max)
++                }
+             }
+             offset += chunk
+         }
+--- a/Sources/ElementCallKit/Media/CallAudioEngine.swift
++++ b/Sources/ElementCallKit/Media/CallAudioEngine.swift
+@@ -38,6 +38,7 @@
+     
+     // Everything below is confined to `queue`.
+     private var isVoiceProcessingConfigured = false
++    private var restoreStereoInput: (() -> Void)?
+     private var inputReceiver: InputSinkReceiver?
+     private var sinkNode: AVAudioSinkNode?
+     private var renderBlocks = [String: SourceRenderBlock]()
+@@ -217,6 +218,8 @@
+             }
+             soundEffectBlock = nil
+             inputReceiver = nil
++            restoreStereoInput?()
++            restoreStereoInput = nil
+             MatrixRTCLog.info("Audio engine shut down")
+         }
+     }
+@@ -242,10 +245,9 @@
+             return
+         }
+         if !isVoiceProcessingConfigured {
+-            // Voice processing (AEC/AGC/NS) must be enabled before prepare(), and only once the
+-            // session is active or the input format reads as 0 Hz.
++            restoreStereoInput = configureStereoInput()
+             do {
+-                try engine.inputNode.setVoiceProcessingEnabled(true)
++                try engine.inputNode.setVoiceProcessingEnabled(restoreStereoInput == nil)
+             } catch {
+                 // The simulator has no voice processing; a call without AEC still works.
+                 MatrixRTCLog.warning("Voice processing unavailable: \(error)")
+@@ -281,6 +283,37 @@
+         inputFormat.store(InputStreamFormat(format))
+         MatrixRTCLog.info("Audio engine started, input \(format)")
+     }
++
++    private func configureStereoInput() -> (() -> Void)? {
++        let session = AVAudioSession.sharedInstance()
++        guard let input = session.currentRoute.inputs.first(where: { $0.portType == .builtInMic }),
++              let source = input.dataSources?.first(where: { $0.supportedPolarPatterns?.contains(.stereo) == true }) else {
++            return nil
++        }
++
++        let previousSource = input.preferredDataSource
++        let previousPattern = source.preferredPolarPattern
++        let previousOrientation = session.preferredInputOrientation
++        let previousMode = session.mode
++        let restore = {
++            try? source.setPreferredPolarPattern(previousPattern)
++            try? input.setPreferredDataSource(previousSource)
++            try? session.setPreferredInputOrientation(previousOrientation)
++            try? session.setMode(previousMode)
++        }
++
++        do {
++            try session.setMode(.default)
++            try source.setPreferredPolarPattern(.stereo)
++            try input.setPreferredDataSource(source)
++            try session.setPreferredInputOrientation(.portrait)
++            return restore
++        } catch {
++            restore()
++            MatrixRTCLog.warning("Stereo microphone configuration unavailable: \(error)")
++            return nil
++        }
++    }
+     
+     private func restart() {
+         queue.async { [weak self] in
+@@ -325,9 +358,9 @@
+             engine.detach(existing)
+         }
+         guard let render = renderBlocks[memberID] else { return }
+-        let node = AVAudioSourceNode(format: AudioFormat.float32, renderBlock: render.block)
++        let node = AVAudioSourceNode(format: AudioFormat.stereoFloat32, renderBlock: render.block)
+         engine.attach(node)
+-        engine.connect(node, to: engine.mainMixerNode, format: AudioFormat.float32)
++        engine.connect(node, to: engine.mainMixerNode, format: AudioFormat.stereoFloat32)
+         sourceNodes[memberID] = node
+     }
+     
+--- a/Sources/ElementCallKit/Media/CameraCaptureFormat.swift
++++ b/Sources/ElementCallKit/Media/CameraCaptureFormat.swift
+@@ -7,9 +7,8 @@
+ 
+ /// Which of a camera's formats to run, and what size every published frame is scaled to.
+ ///
+-/// The published size is what the layers are derived from, so it is held at 720 on the short edge
+-/// whatever the format: LiveKit then encodes 180, 360 and 720, the heights a web sender's layers
+-/// have. The format is chosen for its view, not its size. Formats of one shape do not all show the
++/// The published size targets 1080 on the short edge. LiveKit derives smaller layers from that
++/// size. The format is chosen for its view. Formats of one shape do not all show the
+ /// same scene: on an iPhone 15's back camera 640x480 and 1024x768 are cropped against 1920x1440, and
+ /// on an iPhone XR's front camera they show less than 16:9 does. A 16:9 format such as
+ /// `.hd1280x720`, the obvious one, loses about a quarter of the height of a 4:3 sensor.
+@@ -50,7 +49,7 @@
+     /// What every frame is scaled to; the candidate's own size when it needs no scaling.
+     var output: Size
+     
+-    static let targetShortEdge = 720
++    static let targetShortEdge = 1080
+     /// Below this the core publishes a single layer.
+     static let minimumLongEdge = 480
+     static let frameRate: Double = 30
+@@ -81,7 +80,7 @@
+             return CameraCaptureFormat(candidate: index, output: output)
+         }
+         
+-        // A camera that cannot reach 720 runs the closest it has, unscaled; under 480 on the long
++        // A camera that cannot reach the target runs the closest it has, unscaled; under 480 on the long
+         // edge too, the largest it has, which the core publishes as one layer.
+         let usable = pool.filter { candidates[$0].longEdge >= minimumLongEdge }
+         guard let index = (usable.isEmpty ? pool : usable).max(by: { lhs, rhs in
+--- a/Tests/ElementCallTests/MicrophoneTapTests.swift
++++ b/Tests/ElementCallTests/MicrophoneTapTests.swift
+@@ -18,11 +18,12 @@
+     private func makeTap(_ format: InputStreamFormat = .init(channelCount: 1,
+                                                              isInterleaved: false,
+                                                              sampleRate: 48000),
+-                         ringCapacity: Int = 16384) -> (MicrophoneTap, PCMRingBuffer) {
++                         ringCapacity: Int = 16384,
++                         channels: Int = 1) -> (MicrophoneTap, PCMRingBuffer) {
+         let ring = PCMRingBuffer(capacity: ringCapacity)
+         let snapshot = InputFormatSnapshot()
+         snapshot.store(format)
+-        return (MicrophoneTap(ring: ring, format: snapshot), ring)
++        return (MicrophoneTap(ring: ring, format: snapshot, channelCount: channels), ring)
+     }
+     
+     private func read(_ ring: PCMRingBuffer, count: Int) -> [Int16] {
+@@ -55,6 +56,15 @@
+         }
+         
+         #expect(read(ring, count: 3) == [16383, 8191, 0])
++    }
++
++    @Test
++    func preservesBothInterleavedChannelsForCalls() {
++        let (tap, ring) = makeTap(.init(channelCount: 2, isInterleaved: true, sampleRate: 48000), channels: 2)
++        withAudioBufferList([0.5, -1, 0.25, 1], channelCount: 2) { list in
++            _ = tap.render(frameCount: 2, audioBufferList: list)
++        }
++        #expect(read(ring, count: 4) == [16383, -32767, 8191, 32767])
+     }
+     
+     @Test
+--- a/Tests/ElementCallTests/CameraCaptureFormatTests.swift
++++ b/Tests/ElementCallTests/CameraCaptureFormatTests.swift
+@@ -8,7 +8,7 @@
+ @testable import ElementCallKit
+ import Testing
+ 
+-/// The camera's format is chosen for its view and published at 720 on the short edge. The lists are
++/// The camera's format is chosen for its view and targets 1080 on the short edge. The lists are
+ /// the 420f formats two real phones report, as `CameraCapturer.describeFormats` logs them.
+ nonisolated struct CameraCaptureFormatTests {
+     private typealias Size = CameraCaptureFormat.Size
+@@ -20,7 +20,7 @@
+         
+         // 1024x768 is narrower (65.7°); the binned 1920x1440 has the full view at the cheaper readout.
+         #expect(candidates[format.candidate] == .init(width: 1920, height: 1440, maxFrameRate: 60, fieldOfView: 68.2, isBinned: true))
+-        #expect(format.output == Size(width: 960, height: 720))
++        #expect(format.output == Size(width: 1440, height: 1080))
+     }
+     
+     @Test
+@@ -28,8 +28,8 @@
+         let candidates = Self.parse(Self.iPhone15Front)
+         let format = try #require(CameraCaptureFormat.choose(from: candidates))
+         
+-        #expect(candidates[format.candidate] == .init(width: 1024, height: 768, maxFrameRate: 60, fieldOfView: 73.7, isBinned: false))
+-        #expect(format.output == Size(width: 960, height: 720))
++        #expect(candidates[format.candidate] == .init(width: 1440, height: 1080, maxFrameRate: 60, fieldOfView: 73.7, isBinned: true))
++        #expect(format.output == Size(width: 1440, height: 1080))
+     }
+     
+     @Test
+@@ -38,7 +38,7 @@
+         let format = try #require(CameraCaptureFormat.choose(from: candidates))
+         
+         #expect(candidates[format.candidate] == .init(width: 1920, height: 1440, maxFrameRate: 60, fieldOfView: 67.2, isBinned: true))
+-        #expect(format.output == Size(width: 960, height: 720))
++        #expect(format.output == Size(width: 1440, height: 1080))
+     }
+     
+     @Test
+@@ -48,7 +48,7 @@
+         
+         // Its 60 fps 1920x1440 and its 1024x768 are cropped to 52.2°, narrower than its 16:9.
+         #expect(candidates[format.candidate] == .init(width: 1920, height: 1440, maxFrameRate: 30, fieldOfView: 56.6, isBinned: false))
+-        #expect(format.output == Size(width: 960, height: 720))
++        #expect(format.output == Size(width: 1440, height: 1080))
+     }
+     
+     @Test
+@@ -69,8 +69,8 @@
+         """)
+         let format = try #require(CameraCaptureFormat.choose(from: candidates))
+         
+-        #expect(candidates[format.candidate].width == 1280)
+-        #expect(format.output == Size(width: 1280, height: 720))
++        #expect(candidates[format.candidate].width == 1920)
++        #expect(format.output == Size(width: 1920, height: 1080))
+     }
+     
+     @Test
+@@ -83,11 +83,11 @@
+         let format = try #require(CameraCaptureFormat.choose(from: candidates))
+         
+         #expect(candidates[format.candidate].width == 1024)
+-        #expect(format.output == Size(width: 960, height: 720))
+-    }
+-    
+-    @Test
+-    func aCameraBelowSevenTwentyRunsTheClosestItHasUnscaled() throws {
++        #expect(format.output == Size(width: 1024, height: 768))
++    }
++    
++    @Test
++    func aCameraBelowTheTargetRunsTheClosestItHasUnscaled() throws {
+         let candidates = Self.parse("""
+         320x240 1-30 fps fov 60
+         640x480 1-30 fps fov 60
+@@ -118,10 +118,10 @@
+     
+     @Test
+     func theOutputIsEven() throws {
+-        let format = try #require(CameraCaptureFormat.choose(from: Self.parse("1001x750 1-30 fps fov 66")))
++        let format = try #require(CameraCaptureFormat.choose(from: Self.parse("1501x1125 1-30 fps fov 66")))
+         
+         #expect(format.output.width.isMultiple(of: 2))
+-        #expect(format.output.height == 720)
++        #expect(format.output.height == 1080)
+     }
+     
+     @Test
+
