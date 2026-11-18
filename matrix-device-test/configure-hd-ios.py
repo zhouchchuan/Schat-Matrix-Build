@@ -31,5 +31,6 @@ if __name__ == "__main__":
         ('        .package(url: "https://github.com/element-hq/matrix-rust-rtc", exact: "0.5.0-rc.11"),\n'
          '        // .package(path: "../matrix-rust-rtc"),',
          '        .package(path: "../matrix-rust-rtc"),'),
+        ('swift-snapshot-testing", exact: "1.19.4"', 'swift-snapshot-testing", exact: "1.19.7"'),
     ])
 
