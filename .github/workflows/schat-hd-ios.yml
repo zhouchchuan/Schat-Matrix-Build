@@ -4,7 +4,12 @@ on:
   workflow_dispatch:
   push:
     branches: [elementx/device-test]
-    paths: ['matrix-device-test/hd-ios-native-run.txt']
+    paths:
+      - '.github/workflows/schat-hd-ios.yml'
+      - 'matrix-device-test/hd-ios-native-run.txt'
+      - 'matrix-device-test/hd-ios-app.patch'
+      - 'matrix-device-test/hd-ios-native.patch'
+      - 'matrix-device-test/configure-hd-ios.py'
 
 permissions:
   contents: read
