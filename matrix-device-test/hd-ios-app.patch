@@ -1,0 +1,67 @@
+--- a/NSE/Sources/NotificationHandler.swift
++++ b/NSE/Sources/NotificationHandler.swift
+@@ -254,7 +254,7 @@
+                                       rtcNotificationID: rtcNotifyEventID,
+                                       receiverID: receiverID,
+                                       expirationDate: expirationDate,
+-                                      isVoiceCall: callIntent == RtcCallIntent.audio)
++                                      isVoiceCall: callIntent != RtcCallIntent.video)
+         
+         do {
+             try await CXProvider.reportNewIncomingVoIPPushPayload(payload.dictionary)
+--- a/ElementX/Sources/Application/Settings/AppSettings.swift
++++ b/ElementX/Sources/Application/Settings/AppSettings.swift
+@@ -128,7 +128,7 @@
+     ///
+     /// Account provider is the friendly term for the server name. It should not contain an `https` prefix and should
+     /// match the last part of the user ID. For example `example.com` and not `https://matrix.example.com`.
+-    private(set) var accountProviders: [AccountProvider] = [.managed(serverName: "matrix.org", baseURL: "https://matrix-client.matrix.org")]
++    private(set) var accountProviders: [AccountProvider] = [.managed(serverName: "voice.800play.win:5289", baseURL: "https://voice.800play.win:5289")]
+     /// Whether or not the user is allowed to manually enter their own account provider or must select from one of `defaultAccountProviders`.
+     private(set) var allowOtherAccountProviders = true
+     /// Whether the components surrounding the app brand/logo should be hidden or not
+@@ -405,7 +405,7 @@
+     var hideQuietNotificationAlerts: Bool
+     
+     /// Runs calls through the native matrix-rust-rtc stack instead of the Element Call web view.
+-    @UserPreference(defaultValue: false)
++    @UserPreference(key: "schatHDNativeCalls", defaultValue: true)
+     var nativeCallEnabled: Bool
+     
+     @UserPreference(defaultValue: false)
+--- a/ElementX/Sources/Services/ElementCall/ElementCallServiceConstants.swift
++++ b/ElementX/Sources/Services/ElementCall/ElementCallServiceConstants.swift
+@@ -64,7 +64,7 @@
+                   rtcNotificationID: rtcNotificationID,
+                   receiverID: receiverID,
+                   expirationDate: expirationDate,
+-                  isVoiceCall: dictionary[Key.isVoiceCall.rawValue] as? Bool ?? false)
++                  isVoiceCall: dictionary[Key.isVoiceCall.rawValue] as? Bool ?? true)
+     }
+ }
+ 
+--- a/ElementX/Sources/Services/Timeline/TimelineItems/RoomTimelineItemFactory.swift
++++ b/ElementX/Sources/Services/Timeline/TimelineItems/RoomTimelineItemFactory.swift
+@@ -894,7 +894,7 @@
+                                                    activeMembers: [String],
+                                                    callStartTimestampMillis: UInt64?,
+                                                    isJoined: Bool) -> RoomTimelineItemProtocol {
+-        let isVoiceCall = callIntent == CallIntent.audio.rawValue
++        let isVoiceCall = callIntent != CallIntent.video.rawValue
+         let callStartTimestamp = callStartTimestampMillis.map { Date(timeIntervalSince1970: TimeInterval($0 / 1000)) }
+         
+         return CallNotificationRoomTimelineItem(id: eventItemProxy.id,
+--- a/ElementX/Sources/Screens/RoomScreen/View/RoomCallControlsToolbar.swift
++++ b/ElementX/Sources/Screens/RoomScreen/View/RoomCallControlsToolbar.swift
+@@ -15,8 +15,8 @@
+     var body: some ToolbarContent {
+         if viewState.hasOngoingCall {
+             ToolbarItem(placement: .primaryAction) {
+-                JoinCallButton(isVoiceCall: viewState.activeRoomCallIntent == .audio) {
+-                    onCallTap(viewState.activeRoomCallIntent == .audio)
++                JoinCallButton(isVoiceCall: viewState.activeRoomCallIntent != .video) {
++                    onCallTap(viewState.activeRoomCallIntent != .video)
+                 }
+                 .accessibilityIdentifier(A11yIdentifiers.roomScreen.joinCall)
+                 .disabled(!viewState.canJoinCall)
+
