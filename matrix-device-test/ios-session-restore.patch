@@ -1,0 +1,140 @@
+--- a/ElementX/Sources/Services/UserSession/RestorationToken.swift
++++ b/ElementX/Sources/Services/UserSession/RestorationToken.swift
+@@ -21,6 +21,7 @@
+     
+     enum CodingKeys: CodingKey {
+         case session
++        case sessionDirectoryName
+         case sessionDirectory
+         case cacheDirectory
+         case passphrase
+@@ -33,13 +34,22 @@
+         let container = try decoder.container(keyedBy: CodingKeys.self)
+         
+         let session = try container.decode(Session.self, forKey: .session)
+-        let dataDirectory = try container.decode(URL.self, forKey: .sessionDirectory)
+-        let cacheDirectory = try container.decodeIfPresent(URL.self, forKey: .cacheDirectory)
+-        
+-        let sessionDirectories = if let cacheDirectory {
+-            SessionDirectories(dataDirectory: dataDirectory, cacheDirectory: cacheDirectory)
++        let sessionDirectories: SessionDirectories
++        if let name = try container.decodeIfPresent(String.self, forKey: .sessionDirectoryName) {
++            guard UUID(uuidString: name) != nil else {
++                throw DecodingError.dataCorruptedError(forKey: .sessionDirectoryName, in: container,
++                                                        debugDescription: "Expected a session directory UUID.")
++            }
++            sessionDirectories = .init(sessionDirectoryName: name)
+         } else {
+-            SessionDirectories(dataDirectory: dataDirectory)
++            let dataDirectory = try container.decode(URL.self, forKey: .sessionDirectory)
++            let cacheDirectory = try container.decodeIfPresent(URL.self, forKey: .cacheDirectory)
++            let legacyDirectories = if let cacheDirectory {
++                SessionDirectories(dataDirectory: dataDirectory, cacheDirectory: cacheDirectory)
++            } else {
++                SessionDirectories(dataDirectory: dataDirectory)
++            }
++            sessionDirectories = legacyDirectories.resolvingLegacyPaths()
+         }
+         
+         let base64Passphrase = try container.decode(String.self, forKey: .passphrase)
+@@ -56,8 +66,12 @@
+     func encode(to encoder: any Encoder) throws {
+         var container = encoder.container(keyedBy: CodingKeys.self)
+         try container.encode(session, forKey: .session)
+-        try container.encode(sessionDirectories.dataDirectory, forKey: .sessionDirectory)
+-        try container.encode(sessionDirectories.cacheDirectory, forKey: .cacheDirectory)
++        if let name = sessionDirectories.managedDirectoryName {
++            try container.encode(name, forKey: .sessionDirectoryName)
++        } else {
++            try container.encode(sessionDirectories.dataDirectory, forKey: .sessionDirectory)
++            try container.encode(sessionDirectories.cacheDirectory, forKey: .cacheDirectory)
++        }
+         try container.encode(passphrase.base64EncodedString(), forKey: .passphrase)
+         try container.encode(pusherNotificationClientIdentifier, forKey: .pusherNotificationClientIdentifier)
+     }
+--- a/ElementX/Sources/Services/UserSession/SessionDirectories.swift
++++ b/ElementX/Sources/Services/UserSession/SessionDirectories.swift
+@@ -81,9 +81,32 @@
+ nonisolated extension SessionDirectories {
+     /// Creates a fresh set of session directories for a new user.
+     init() {
+-        let sessionDirectoryName = UUID().uuidString
+-        dataDirectory = .sessionsBaseDirectory.appending(component: sessionDirectoryName)
+-        cacheDirectory = .sessionCachesBaseDirectory.appending(component: sessionDirectoryName)
++        self.init(sessionDirectoryName: UUID().uuidString)
++    }
++
++    init(sessionDirectoryName: String) {
++        dataDirectory = .sessionsBaseDirectory.appending(component: sessionDirectoryName, directoryHint: .isDirectory)
++        cacheDirectory = .sessionCachesBaseDirectory.appending(component: sessionDirectoryName, directoryHint: .isDirectory)
++    }
++
++    var managedDirectoryName: String? {
++        let name = dataDirectory.lastPathComponent
++        guard UUID(uuidString: name) != nil else { return nil }
++        let current = Self(sessionDirectoryName: name)
++        guard current.dataPath == dataPath, current.cachePath == cachePath else { return nil }
++        return name
++    }
++
++    /// Older restoration tokens stored absolute paths, which can change during an iOS update.
++    func resolvingLegacyPaths() -> Self {
++        let name = dataDirectory.lastPathComponent
++        let rootSuffix = URL.sessionsBaseDirectory.pathComponents.suffix(4)
++        let savedParent = dataDirectory.deletingLastPathComponent()
++        guard dataDirectory.isFileURL, UUID(uuidString: name) != nil,
++              savedParent.pathComponents.suffix(rootSuffix.count).elementsEqual(rootSuffix) else { return self }
++
++        let current = Self(sessionDirectoryName: name)
++        return current.isNonTransientUserDataValid() ? current : self
+     }
+     
+     /// Creates the session directories for a user who has a single session directory stored without a separate caches directory.
+--- a/UnitTests/Sources/RestorationTokenTests.swift
++++ b/UnitTests/Sources/RestorationTokenTests.swift
+@@ -96,6 +96,45 @@
+     }
+     
+     @Test
++    func restoresCryptoStoreAfterAppContainerMoves() throws {
++        let current = SessionDirectories()
++        try FileManager.default.createDirectory(at: current.dataDirectory, withIntermediateDirectories: true)
++        defer { try? current.delete() }
++        try Data().write(to: current.dataDirectory.appending(component: "matrix-sdk-crypto.sqlite3"))
++
++        let previousContainer = FileManager.default.temporaryDirectory.appending(component: UUID().uuidString)
++        let previousData = current.dataDirectory.pathComponents.suffix(5).reduce(previousContainer) { url, component in
++            url.appending(component: component)
++        }
++        let previousCache = current.cacheDirectory.pathComponents.suffix(5).reduce(previousContainer) { url, component in
++            url.appending(component: component)
++        }
++        let original = RestorationTokenV5(session: SessionV1(accessToken: "1234",
++                                                            refreshToken: nil,
++                                                            userId: "@user:example.com",
++                                                            deviceId: "D3V1C3",
++                                                            homeserverUrl: "https://matrix.example.com",
++                                                            oidcData: nil,
++                                                            slidingSyncVersion: .native),
++                                         sessionDirectory: previousData,
++                                         cacheDirectory: previousCache,
++                                         passphrase: RestorationTokenFixtures.base64Passphrase,
++                                         pusherNotificationClientIdentifier: nil)
++
++        let token = try JSONDecoder().decode(RestorationToken.self, from: JSONEncoder().encode(original))
++        #expect(token.sessionDirectories == current)
++        #expect(token.sessionDirectories.isNonTransientUserDataValid())
++        #expect(token.session.deviceId == original.session.deviceId)
++        #expect(token.passphrase == RestorationTokenFixtures.passphrase)
++
++        let rewritten = try JSONEncoder().encode(token)
++        let fields = try #require(JSONSerialization.jsonObject(with: rewritten) as? [String: Any])
++        #expect(fields["sessionDirectoryName"] as? String == current.dataDirectory.lastPathComponent)
++        #expect(fields["sessionDirectory"] == nil)
++        #expect(fields["cacheDirectory"] == nil)
++    }
++
++    @Test
+     func decodeFromCurrentToken() throws {
+         // Given an encoded restoration token in the current format.
+         let originalToken = RestorationToken(session: Session(accessToken: "1234",
