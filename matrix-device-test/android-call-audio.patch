@@ -1,3 +1,94 @@
+diff --git a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenView.kt b/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenView.kt
+index 33c3024f..6b39259e 100644
+--- a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenView.kt
++++ b/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenView.kt
+@@ -88,7 +88,6 @@ internal fun CallScreenView(
+             onSubmit = { state.eventSink(CallScreenEvent.Hangup) },
+         )
+     } else {
+-        var webViewAudioManager by remember { mutableStateOf<WebViewAudioManager?>(null) }
+         val coroutineScope = rememberCoroutineScope()
+ 
+         var invalidAudioDeviceReason by remember { mutableStateOf<InvalidAudioDeviceReason?>(null) }
+@@ -111,13 +110,19 @@ internal fun CallScreenView(
+             onCreateWebView = { webView ->
+                 callWebView = webView
+                 webView.addBackHandler(onBackPressed = ::handleBack)
++                val audioManager = WebViewAudioManager(
++                    webView = webView,
++                    coroutineScope = coroutineScope,
++                    onInvalidAudioDeviceAdded = { invalidAudioDeviceReason = it },
++                )
++                webView.setTag(R.id.call_widget_audio_manager, audioManager)
+                 val interceptor = WebViewWidgetMessageInterceptor(
+                     webView = webView,
+                     onUrlLoaded = { url ->
+                         webView.evaluateJavascript("controls.onBackButtonPressed = () => { backHandler.onBackPressed() }", null)
+-                        if (webViewAudioManager?.isInCallMode?.get() == false) {
++                        if (!audioManager.isInCallMode.get()) {
+                             Timber.d("URL $url is loaded, starting in-call audio mode")
+-                            webViewAudioManager?.onCallStarted()
++                            audioManager.onCallStarted()
+                             pipState.eventSink(PictureInPictureEvent.OnCallStarted)
+                         } else {
+                             Timber.d("Can't start in-call audio mode since the app is already in it.")
+@@ -125,11 +130,6 @@ internal fun CallScreenView(
+                     },
+                     onError = { state.eventSink(CallScreenEvent.OnWebViewError(it)) },
+                 )
+-                webViewAudioManager = WebViewAudioManager(
+-                    webView = webView,
+-                    coroutineScope = coroutineScope,
+-                    onInvalidAudioDeviceAdded = { invalidAudioDeviceReason = it },
+-                )
+                 state.eventSink(CallScreenEvent.SetupMessageChannels(interceptor))
+                 val pipController = WebViewPipController(
+                     webView = webView,
+@@ -139,10 +139,9 @@ internal fun CallScreenView(
+                 )
+                 pipState.eventSink(PictureInPictureEvent.SetPipController(pipController))
+             },
+-            onDestroyWebView = {
+-                callWebView = null
+-                // Reset audio mode
+-                webViewAudioManager?.onCallStopped()
++            onDestroyWebView = { webView ->
++                if (callWebView === webView) callWebView = null
++                (webView.getTag(R.id.call_widget_audio_manager) as? WebViewAudioManager)?.onCallStopped()
+             }
+         )
+         when (state.urlState) {
+@@ -204,7 +203,9 @@ private fun CallWebView(
+                 }
+             },
+             update = { webView ->
+-                if (url is AsyncData.Success && webView.url != url.data) {
++                // The widget can update its own URL. A Compose update must not reload an ongoing call.
++                if (url is AsyncData.Success && webView.getTag(R.id.call_widget_requested_url) != url.data) {
++                    webView.setTag(R.id.call_widget_requested_url, url.data)
+                     webView.loadUrl(url.data)
+                 }
+             },
+diff --git a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/ElementCallActivity.kt b/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/ElementCallActivity.kt
+index 4a6b8f1c..18e6ec3f 100644
+--- a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/ElementCallActivity.kt
++++ b/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/ElementCallActivity.kt
+@@ -256,12 +256,13 @@ class ElementCallActivity :
+         } else {
+             if (callData == null) {
+                 Timber.tag(loggerTag.value).d("Coming back from notification, do nothing")
+-            } else if (callData != currentCallData) {
++            } else if (callData.sessionId != currentCallData.sessionId || callData.roomId != currentCallData.roomId) {
+                 Timber.tag(loggerTag.value).d("User starts another call, restart the Activity")
+                 setIntent(intent)
+                 recreate()
+             } else {
+-                // Starting the same call again, should not happen, the UI is preventing this. But maybe when using external links.
++                // The room banner and notification can disagree about the initial audio/video mode.
++                // Keep the existing call when both refer to the same room and account.
+                 Timber.tag(loggerTag.value).d("Starting the same call again, do nothing")
+             }
+         }
 diff --git a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/IncomingCallActivity.kt b/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/IncomingCallActivity.kt
 index a4bb9eef..a6d4a525 100644
 --- a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/IncomingCallActivity.kt
@@ -34,7 +125,7 @@ index a4bb9eef..a6d4a525 100644
  
      private fun onCancel() {
 diff --git a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/utils/WebViewAudioManager.kt b/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/utils/WebViewAudioManager.kt
-index 32902699..e92bc2cc 100644
+index 32902699..088bd9eb 100644
 --- a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/utils/WebViewAudioManager.kt
 +++ b/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/utils/WebViewAudioManager.kt
 @@ -17,10 +17,12 @@ import android.os.PowerManager
@@ -76,7 +167,7 @@ index 32902699..e92bc2cc 100644
      }
  
      /**
-@@ -201,23 +206,29 @@ class WebViewAudioManager(
+@@ -201,23 +206,27 @@ class WebViewAudioManager(
              return
          }
  
@@ -95,26 +186,27 @@ index 32902699..e92bc2cc 100644
 -            return
 -        }
 -
-         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-             audioManager.clearCommunicationDevice()
+-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+-            audioManager.clearCommunicationDevice()
 -            audioManager.removeOnCommunicationDeviceChangedListener(commsDeviceChangedListener)
-+        } else {
-+            audioManager.selectAudioDevice(null)
-         }
- 
--        audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
-+        if (hasRegisteredCallbacks) {
-+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-+                audioManager.removeOnCommunicationDeviceChangedListener(commsDeviceChangedListener)
++        try {
++            if (hasRegisteredCallbacks) {
++                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
++                    audioManager.removeOnCommunicationDeviceChangedListener(commsDeviceChangedListener)
++                }
++                audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
++                hasRegisteredCallbacks = false
 +            }
-+            audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
-+            hasRegisteredCallbacks = false
-+        }
-+        audioManager.mode = AudioManager.MODE_NORMAL
++        } finally {
++            audioManager.selectAudioDevice(null)
++            audioManager.mode = AudioManager.MODE_NORMAL
+         }
+-
+-        audioManager.unregisterAudioDeviceCallback(audioDeviceCallback)
      }
  
      /**
-@@ -228,27 +239,17 @@ class WebViewAudioManager(
+@@ -228,27 +237,17 @@ class WebViewAudioManager(
      private fun registerWebViewDeviceSelectedCallback() {
          val webViewAudioDeviceSelectedCallback = AndroidWebViewAudioBridge(
              onAudioDeviceSelected = { selectedDeviceId ->
@@ -150,7 +242,7 @@ index 32902699..e92bc2cc 100644
                  }
              },
          )
-@@ -256,6 +257,24 @@ class WebViewAudioManager(
+@@ -256,6 +255,24 @@ class WebViewAudioManager(
          webView.addJavascriptInterface(webViewAudioDeviceSelectedCallback, "androidNativeBridge")
      }
  
@@ -175,6 +267,18 @@ index 32902699..e92bc2cc 100644
      /**
       * Assigns the callback in the WebView to be called when the user selects an audio device.
       *
+diff --git a/features/call/impl/src/main/res/values/do_not_translate.xml b/features/call/impl/src/main/res/values/do_not_translate.xml
+index deb835b3..0ddb3c7f 100644
+--- a/features/call/impl/src/main/res/values/do_not_translate.xml
++++ b/features/call/impl/src/main/res/values/do_not_translate.xml
+@@ -6,5 +6,7 @@
+   ~ Please see LICENSE files in the repository root for full details.
+   -->
+ <resources>
++    <item name="call_widget_audio_manager" type="id" />
++    <item name="call_widget_requested_url" type="id" />
+     <string translatable="false" name="element_call">Element Call</string>
+ </resources>
 diff --git a/libraries/mediaplayer/impl/src/main/kotlin/io/element/android/libraries/mediaplayer/impl/DefaultMediaPlayer.kt b/libraries/mediaplayer/impl/src/main/kotlin/io/element/android/libraries/mediaplayer/impl/DefaultMediaPlayer.kt
 index 12b36207..3703ee26 100644
 --- a/libraries/mediaplayer/impl/src/main/kotlin/io/element/android/libraries/mediaplayer/impl/DefaultMediaPlayer.kt
@@ -291,6 +395,53 @@ index 9bec86e7..f8d03cff 100644
          })
      }
  
+diff --git a/libraries/mediaplayer/impl/src/main/kotlin/io/element/android/libraries/mediaplayer/impl/di/SimplePlayerBindingContainer.kt b/libraries/mediaplayer/impl/src/main/kotlin/io/element/android/libraries/mediaplayer/impl/di/SimplePlayerBindingContainer.kt
+index 85518e58..560c6536 100644
+--- a/libraries/mediaplayer/impl/src/main/kotlin/io/element/android/libraries/mediaplayer/impl/di/SimplePlayerBindingContainer.kt
++++ b/libraries/mediaplayer/impl/src/main/kotlin/io/element/android/libraries/mediaplayer/impl/di/SimplePlayerBindingContainer.kt
+@@ -8,8 +8,14 @@
+ package io.element.android.libraries.mediaplayer.impl.di
+ 
+ import android.content.Context
++import androidx.annotation.OptIn
++import androidx.media3.common.AudioAttributes
+ import androidx.media3.common.C
++import androidx.media3.common.MimeTypes
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.exoplayer.DefaultRenderersFactory
+ import androidx.media3.exoplayer.ExoPlayer
++import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
+ import dev.zacsweers.metro.BindingContainer
+ import dev.zacsweers.metro.ContributesTo
+ import dev.zacsweers.metro.Provides
+@@ -22,7 +28,26 @@ import io.element.android.libraries.mediaplayer.impl.SimplePlayer
+ @BindingContainer
+ object SimplePlayerBindingContainer {
+     @Provides
++    @OptIn(UnstableApi::class)
+     fun providesSimplePlayer(
+         @ApplicationContext context: Context,
+-    ): SimplePlayer = DefaultSimplePlayer(ExoPlayer.Builder(context).setWakeMode(C.WAKE_MODE_LOCAL).build())
++    ): SimplePlayer {
++        val renderers = DefaultRenderersFactory(context)
++            .setEnableDecoderFallback(true)
++            .setMediaCodecSelector { mimeType, secure, tunneling ->
++                val decoders = MediaCodecSelector.DEFAULT.getDecoderInfos(mimeType, secure, tunneling)
++                // Prefer the platform software decoder for short Opus voice notes, with the vendor decoder as a fallback.
++                if (mimeType == MimeTypes.AUDIO_OPUS) decoders.sortedByDescending { it.softwareOnly } else decoders
++            }
++        val attributes = AudioAttributes.Builder()
++            .setUsage(C.USAGE_MEDIA)
++            .setContentType(C.AUDIO_CONTENT_TYPE_SPEECH)
++            .build()
++        val player = ExoPlayer.Builder(context, renderers)
++            .setWakeMode(C.WAKE_MODE_LOCAL)
++            // The voice message player already manages audio focus.
++            .setAudioAttributes(attributes, false)
++            .build()
++        return DefaultSimplePlayer(player)
++    }
+ }
 diff --git a/libraries/mediaplayer/impl/src/test/kotlin/io/element/android/libraries/mediaplayer/impl/DefaultMediaPlayerTest.kt b/libraries/mediaplayer/impl/src/test/kotlin/io/element/android/libraries/mediaplayer/impl/DefaultMediaPlayerTest.kt
 index 7807b3ac..c54faa21 100644
 --- a/libraries/mediaplayer/impl/src/test/kotlin/io/element/android/libraries/mediaplayer/impl/DefaultMediaPlayerTest.kt
@@ -418,3 +569,16 @@ index 510b80ba..d0e414af 100644
                  startPositionMs = if (state.isEnded) 0L else state.currentPosition,
              )
          }
+diff --git a/plugins/src/main/kotlin/Versions.kt b/plugins/src/main/kotlin/Versions.kt
+index 91a38d69..b916b4ce 100644
+--- a/plugins/src/main/kotlin/Versions.kt
++++ b/plugins/src/main/kotlin/Versions.kt
+@@ -45,7 +45,7 @@ private const val versionMonth = 11
+  * Release number in the month. Value must be in [0,99].
+  * Do not update this value. it is updated by the release script.
+  */
+-private const val versionReleaseNumber = 0
++private const val versionReleaseNumber = 1
+ 
+ object Versions {
+     /**
