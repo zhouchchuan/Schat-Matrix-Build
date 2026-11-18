@@ -1,0 +1,239 @@
+--- a/ElementX/Sources/Services/Audio/AudioConverter.swift
++++ b/ElementX/Sources/Services/Audio/AudioConverter.swift
+@@ -22,11 +22,49 @@
+ nonisolated struct AudioConverter: AudioConverterProtocol {
+     func convertToOpusOgg(sourceURL: URL, destinationURL: URL) throws {
+         do {
+-            try OGGConverter.convertM4aFileToOpusOGG(src: sourceURL, dest: destinationURL)
++            let source = try AVAudioFile(forReading: sourceURL, commonFormat: .pcmFormatInt16, interleaved: true)
++            if source.processingFormat.channelCount == 2 {
++                try encodeStereoOpus(source, to: destinationURL)
++            } else {
++                try OGGConverter.convertM4aFileToOpusOGG(src: sourceURL, dest: destinationURL)
++            }
+         } catch {
+             MXLog.error("failed to convert to OpusOgg: \(error)")
+             throw AudioConverterError.conversionFailed(error)
+         }
++    }
++
++    private func encodeStereoOpus(_ source: AVAudioFile, to destinationURL: URL) throws {
++        let format = source.processingFormat
++        // SwiftOGG's M4A helper reads planar PCM and only passes the first channel.
++        let encoder = try OGGEncoder(format: format.streamDescription.pointee,
++                                     opusRate: Int32(format.sampleRate),
++                                     application: .audio)
++        let framesPerPacket = Int(format.sampleRate) / 50
++        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(framesPerPacket * 50)),
++              FileManager.default.createFile(atPath: destinationURL.path, contents: nil) else {
++            throw AudioConverterError.conversionFailed(nil)
++        }
++        let destination = try FileHandle(forWritingTo: destinationURL)
++        defer { try? destination.close() }
++
++        while source.framePosition < source.length {
++            try source.read(into: buffer)
++            let frameCount = Int(buffer.frameLength)
++            let pcm = buffer.audioBufferList.pointee.mBuffers
++            guard frameCount > 0, let data = pcm.mData else {
++                throw AudioConverterError.conversionFailed(nil)
++            }
++            var samples = Data(bytes: data, count: Int(pcm.mDataByteSize))
++            let finalPacketFrames = frameCount % framesPerPacket
++            if source.framePosition == source.length, finalPacketFrames != 0 {
++                let frameSize = Int(format.streamDescription.pointee.mBytesPerFrame)
++                samples.append(Data(count: (framesPerPacket - finalPacketFrames) * frameSize))
++            }
++            try encoder.encode(pcm: samples)
++            try destination.write(contentsOf: encoder.bitstream())
++        }
++        try destination.write(contentsOf: encoder.bitstream(flush: true))
+     }
+     
+     func convertToMPEG4AAC(sourceURL: URL, destinationURL: URL) throws {
+--- a/ElementX/Sources/Services/Audio/Recorder/AudioRecorder.swift
++++ b/ElementX/Sources/Services/Audio/Recorder/AudioRecorder.swift
+@@ -27,6 +27,7 @@
+     private var mixer: AVAudioMixerNode?
+     private var audioFile: AVAudioFile?
+     private var audioConverter: AVAudioConverter?
++    private var restoreStereoInput: (() -> Void)?
+     private var internalState = InternalAudioRecorderState.stopped
+     
+     private var cancellables = Set<AnyCancellable>()
+@@ -67,7 +68,17 @@
+             setInternalState(.error(.recordPermissionNotGranted))
+             return
+         }
+-        let result = await startRecording(audioFileURL: audioFileURL)
++        let orientation = await MainActor.run {
++            let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
++                .first { $0.activationState == .foregroundActive }
++            switch scene?.interfaceOrientation {
++            case .landscapeLeft: return AVAudioStereoOrientation.landscapeLeft
++            case .landscapeRight: return .landscapeRight
++            case .portraitUpsideDown: return .portraitUpsideDown
++            default: return .portrait
++            }
++        }
++        let result = await startRecording(audioFileURL: audioFileURL, orientation: orientation)
+         switch result {
+         case .success:
+             setInternalState(.recording)
+@@ -106,24 +117,52 @@
+         }
+     }
+     
+-    private func setupAudioSession() throws {
++    private func setupAudioSession(orientation: AVAudioStereoOrientation) throws {
+         MXLog.info("setup audio session")
+         
+         try audioSession.setAllowHapticsAndSystemSoundsDuringRecording(true)
+         try audioSession.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothHFP])
+         try audioSession.setActive(true)
++        configureStereoInput(orientation: orientation)
+         addObservers()
++    }
++
++    private func configureStereoInput(orientation: AVAudioStereoOrientation) {
++        guard let session = audioSession as? AVAudioSession,
++              let port = session.currentRoute.inputs.first(where: { $0.portType == .builtInMic }),
++              let source = port.dataSources?.first(where: { $0.supportedPolarPatterns?.contains(.stereo) == true }) else {
++            return
++        }
++
++        let previousSource = port.preferredDataSource
++        let previousPattern = source.preferredPolarPattern
++        restoreStereoInput = {
++            try? source.setPreferredPolarPattern(previousPattern)
++            try? port.setPreferredDataSource(previousSource)
++        }
++
++        do {
++            try source.setPreferredPolarPattern(.stereo)
++            try port.setPreferredDataSource(source)
++            try session.setPreferredInputOrientation(orientation)
++        } catch {
++            MXLog.warning("Stereo input configuration failed: \(error)")
++            restoreStereoInput?()
++            restoreStereoInput = nil
++        }
+     }
+     
+     private func releaseAudioSession() {
+         MXLog.info("releasing audio session")
++        removeObservers()
++        restoreStereoInput?()
++        restoreStereoInput = nil
+         try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+-        removeObservers()
+-    }
+-    
+-    private func startRecording(audioFileURL: URL) async -> Result<Void, AudioRecorderError> {
++    }
++    
++    private func startRecording(audioFileURL: URL, orientation: AVAudioStereoOrientation) async -> Result<Void, AudioRecorderError> {
+         await withCheckedContinuation { continuation in
+-            startRecording(audioFileURL: audioFileURL) { result in
++            startRecording(audioFileURL: audioFileURL, orientation: orientation) { result in
+                 continuation.resume(returning: result)
+             }
+         }
+@@ -132,15 +171,17 @@
+     private func createAudioFile(at recordingURL: URL) throws -> AVAudioFile {
+         let settings = [AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+                         AVSampleRateKey: Int(recordingFormat.sampleRate),
+-                        AVEncoderBitRateKey: 128_000,
+-                        AVNumberOfChannelsKey: 1,
++                        AVEncoderBitRateKey: recordingFormat.channelCount == 2 ? 192_000 : 128_000,
++                        AVNumberOfChannelsKey: Int(recordingFormat.channelCount),
+                         AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue]
+         MXLog.info("creating audio file with format: \(settings)")
+         try? FileManager.default.removeItem(at: recordingURL)
+         return try AVAudioFile(forWriting: recordingURL, settings: settings)
+     }
+     
+-    private func startRecording(audioFileURL: URL, completion: @escaping @Sendable (Result<Void, AudioRecorderError>) -> Void) {
++    private func startRecording(audioFileURL: URL,
++                                orientation: AVAudioStereoOrientation,
++                                completion: @escaping @Sendable (Result<Void, AudioRecorderError>) -> Void) {
+         dispatchQueue.async { [weak self] in
+             guard let self, !self.stopped else {
+                 completion(.failure(.recordingCancelled))
+@@ -148,7 +189,7 @@
+             }
+             
+             do {
+-                try setupAudioSession()
++                try setupAudioSession(orientation: orientation)
+             } catch {
+                 MXLog.error("failed to setup audio session. \(error)")
+                 completion(.failure(.audioSessionFailure))
+@@ -171,16 +212,14 @@
+                 return
+             }
+             
+-            // Define a recording audio format. Force the sample rate to 48000 to ensure OGGEncoder won't crash
+-            guard let recordingFormat = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1) else {
++            let channels = min(inputFormat.channelCount, 2)
++            guard let recordingFormat = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: channels),
++                  let mixerFormat = AVAudioFormat(standardFormatWithSampleRate: hardwareSampleRate, channels: channels) else {
+                 completion(.failure(.unsupportedAudioFormat))
+                 return
+             }
+             self.recordingFormat = recordingFormat
+             
+-            // Make sure we have 1 channel at the end by using a mixer.
+-            // The sample rate must match the hardware sample rate.
+-            let mixerFormat = AVAudioFormat(standardFormatWithSampleRate: hardwareSampleRate, channels: 1)
+             let mixer = AVAudioMixerNode()
+             self.mixer = mixer
+             audioEngine.attach(mixer)
+@@ -205,7 +244,7 @@
+             // Note: Not all Apple devices have the same default sample rate.
+             if recordingFormat.sampleRate != hardwareSampleRate {
+                 MXLog.info("Sample rate conversion is needed \(hardwareSampleRate) -> \(recordingFormat.sampleRate)")
+-                audioConverter = AVAudioConverter(from: inputFormat, to: recordingFormat)
++                audioConverter = AVAudioConverter(from: mixerFormat, to: recordingFormat)
+             } else {
+                 audioConverter = nil
+             }
+@@ -285,7 +324,7 @@
+         if let audioConverter {
+             // Create an AVAudioPCMBuffer instance for the converted buffer
+             let conversionRatio = buffer.format.sampleRate / recordingFormat.sampleRate
+-            let frameCapacity = UInt32(Double(buffer.frameLength) / conversionRatio)
++            let frameCapacity = UInt32(ceil(Double(buffer.frameLength) / conversionRatio))
+             guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: recordingFormat, frameCapacity: frameCapacity) else {
+                 MXLog.error("failed to initialize an output buffer")
+                 return
+@@ -295,7 +334,13 @@
+             // The block type is `@Sendable` but `convert(to:error:withInputFrom:)`
+             // invokes it synchronously on this same thread, the buffer never crosses.
+             nonisolated(unsafe) let inputBufferForConversion = buffer
++            nonisolated(unsafe) var suppliedInput = false
+             let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
++                guard !suppliedInput else {
++                    outStatus.pointee = .noDataNow
++                    return nil
++                }
++                suppliedInput = true
+                 outStatus.pointee = AVAudioConverterInputStatus.haveData
+                 return inputBufferForConversion
+             }
+@@ -452,8 +497,12 @@
+         }
+         
+         // Compute RMS
+-        var rms: Float = .nan
+-        vDSP_rmsqv(channelData.pointee, buffer.stride, &rms, vDSP_Length(buffer.frameLength))
++        var rms: Float = 0
++        for channel in 0..<Int(buffer.format.channelCount) {
++            var channelRMS: Float = 0
++            vDSP_rmsqv(channelData[channel], buffer.stride, &channelRMS, vDSP_Length(buffer.frameLength))
++            rms = max(rms, channelRMS)
++        }
+         
+         // Convert to decibels
+         let avgPower = 20 * log10(rms)
+
