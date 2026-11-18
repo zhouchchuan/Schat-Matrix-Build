@@ -1,0 +1,80 @@
+name: Build Schat HD call native libraries
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [elementx/device-test]
+    paths:
+      - '.github/workflows/schat-hd-native.yml'
+      - 'matrix-device-test/prepare-call-core.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: schat-hd-native
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: element-hq/matrix-rust-rtc
+          ref: v0.5.0-rc.8
+          path: matrix-rtc
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Build pinned Android MatrixRTC for ARM64
+        run: |
+          python3 matrix-device-test/prepare-call-core.py matrix-rtc
+          cd matrix-rtc
+          cargo install cargo-ndk --locked
+          MEDIA=1 bash scripts/build-android-aar.sh --target aarch64-linux-android
+          MEDIA=1 bash scripts/build-android-aar.sh --skip-build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: Schat-HD-RTC-Android-ARM64
+          path: matrix-rtc/mobile/android/matrixrtc/build/outputs/aar/matrixrtc-release.aar
+          if-no-files-found: error
+
+  ios:
+    runs-on: xcode-27
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: element-hq/matrix-rust-rtc
+          ref: v0.5.0-rc.11
+          path: matrix-rtc
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Build pinned iOS MatrixRTC
+        run: |
+          python3 matrix-device-test/prepare-call-core.py matrix-rtc
+          cd matrix-rtc
+          MEDIA=1 bash scripts/build-ios-xcframework.sh --swift-out Sources/MatrixRtc
+          cp mobile/ios/Debug-Package.swift Package.swift
+          zip -qry "$RUNNER_TEMP/schat-matrix-rtc-ios.zip" Package.swift Sources mobile/ios/build/MatrixRtcFFI.xcframework
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: Schat-HD-RTC-iOS
+          path: ${{ runner.temp }}/schat-matrix-rtc-ios.zip
+          if-no-files-found: error
+
