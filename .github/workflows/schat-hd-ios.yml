@@ -1,0 +1,84 @@
+name: Package Schat HD calls for iPhone
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [elementx/device-test]
+    paths: ['matrix-device-test/hd-ios-native-run.txt']
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: schat-hd-ios-app
+  cancel-in-progress: true
+
+jobs:
+  ios:
+    runs-on: xcode-27
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: element-hq/element-x-ios
+          ref: 631ec73e088da90ac91b453a3ef3541c8c1dff18
+          path: matrix-ios
+          persist-credentials: false
+          lfs: true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: element-hq/element-call-ios
+          ref: d76e399cb533f3d9198a2d729061ff3e3dcce071
+          path: element-call-ios
+          persist-credentials: false
+          lfs: true
+      - name: Select the matching tuned native build
+        id: native
+        run: |
+          run_id="$(cat matrix-device-test/hd-ios-native-run.txt)"
+          [[ "$run_id" =~ ^[0-9]+$ ]]
+          printf 'run_id=%s\n' "$run_id" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v5
+        with:
+          name: Schat-HD-RTC-iOS
+          path: amedia
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.native.outputs.run_id }}
+      - name: Configure the iPhone build
+        run: |
+          ditto -x -k amedia/schat-matrix-rtc-ios.zip matrix-rust-rtc
+          python3 matrix-device-test/configure-hd-ios.py matrix-ios element-call-ios
+          brew list --versions xcodegen || brew install xcodegen
+          cd matrix-ios
+          xcodegen
+      - name: Build and verify the unsigned IPA
+        working-directory: matrix-ios
+        run: |
+          set -o pipefail
+          xcodebuild -project ElementX.xcodeproj -scheme ElementX -configuration Release \
+            -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/schat-hd-build" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build | tee "$RUNNER_TEMP/xcodebuild.log" | xcbeautify
+          app="$RUNNER_TEMP/schat-hd-build/Build/Products/Release-iphoneos/ElementX.app"
+          test -f "$app/ElementX"
+          plutil -extract CFBundleIdentifier raw "$app/Info.plist" | grep -Fx win.play800.schat.matrix
+          plutil -extract CFBundleVersion raw "$app/Info.plist" | grep -Fx 5
+          mkdir -p "$RUNNER_TEMP/hd-package/Payload"
+          ditto "$app" "$RUNNER_TEMP/hd-package/Payload/ElementX.app"
+          cd "$RUNNER_TEMP/hd-package"
+          zip -qry "$RUNNER_TEMP/Schat-Matrix-iOS-26.11.2-build5-hd-call-unsigned.ipa" Payload
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: Schat-HD-Call-iOS-unsigned
+          path: ${{ runner.temp }}/Schat-Matrix-iOS-26.11.2-build5-hd-call-unsigned.ipa
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: failure()
+        with:
+          name: Schat-HD-Call-iOS-build-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+
