@@ -66,11 +66,11 @@
              return
          }
 -        let result = await startRecording(audioFileURL: audioFileURL)
-+        let orientation = await MainActor.run {
++        let orientation = await MainActor.run { () -> AVAudioSession.StereoOrientation in
 +            let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
 +                .first { $0.activationState == .foregroundActive }
 +            switch scene?.interfaceOrientation {
-+            case .landscapeLeft: return AVAudioStereoOrientation.landscapeLeft
++            case .landscapeLeft: return .landscapeLeft
 +            case .landscapeRight: return .landscapeRight
 +            case .portraitUpsideDown: return .portraitUpsideDown
 +            default: return .portrait
@@ -80,12 +80,12 @@
          switch result {
          case .success:
              setInternalState(.recording)
-@@ -106,24 +117,52 @@
+@@ -106,24 +117,54 @@
          }
      }
      
 -    private func setupAudioSession() throws {
-+    private func setupAudioSession(orientation: AVAudioStereoOrientation) throws {
++    private func setupAudioSession(orientation: AVAudioSession.StereoOrientation) throws {
          MXLog.info("setup audio session")
          
          try audioSession.setAllowHapticsAndSystemSoundsDuringRecording(true)
@@ -95,7 +95,7 @@
          addObservers()
 +    }
 +
-+    private func configureStereoInput(orientation: AVAudioStereoOrientation) {
++    private func configureStereoInput(orientation: AVAudioSession.StereoOrientation) {
 +        guard let session = audioSession as? AVAudioSession,
 +              let port = session.currentRoute.inputs.first(where: { $0.portType == .builtInMic }),
 +              let source = port.dataSources?.first(where: { $0.supportedPolarPatterns?.contains(.stereo) == true }) else {
@@ -104,9 +104,11 @@
 +
 +        let previousSource = port.preferredDataSource
 +        let previousPattern = source.preferredPolarPattern
++        let previousOrientation = session.preferredInputOrientation
 +        restoreStereoInput = {
 +            try? source.setPreferredPolarPattern(previousPattern)
 +            try? port.setPreferredDataSource(previousSource)
++            try? session.setPreferredInputOrientation(previousOrientation)
 +        }
 +
 +        do {
@@ -132,14 +134,14 @@
 -    private func startRecording(audioFileURL: URL) async -> Result<Void, AudioRecorderError> {
 +    }
 +    
-+    private func startRecording(audioFileURL: URL, orientation: AVAudioStereoOrientation) async -> Result<Void, AudioRecorderError> {
++    private func startRecording(audioFileURL: URL, orientation: AVAudioSession.StereoOrientation) async -> Result<Void, AudioRecorderError> {
          await withCheckedContinuation { continuation in
 -            startRecording(audioFileURL: audioFileURL) { result in
 +            startRecording(audioFileURL: audioFileURL, orientation: orientation) { result in
                  continuation.resume(returning: result)
              }
          }
-@@ -132,15 +171,17 @@
+@@ -132,15 +173,17 @@
      private func createAudioFile(at recordingURL: URL) throws -> AVAudioFile {
          let settings = [AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
                          AVSampleRateKey: Int(recordingFormat.sampleRate),
@@ -155,12 +157,12 @@
      
 -    private func startRecording(audioFileURL: URL, completion: @escaping @Sendable (Result<Void, AudioRecorderError>) -> Void) {
 +    private func startRecording(audioFileURL: URL,
-+                                orientation: AVAudioStereoOrientation,
++                                orientation: AVAudioSession.StereoOrientation,
 +                                completion: @escaping @Sendable (Result<Void, AudioRecorderError>) -> Void) {
          dispatchQueue.async { [weak self] in
              guard let self, !self.stopped else {
                  completion(.failure(.recordingCancelled))
-@@ -148,7 +189,7 @@
+@@ -148,7 +191,7 @@
              }
              
              do {
@@ -169,7 +171,7 @@
              } catch {
                  MXLog.error("failed to setup audio session. \(error)")
                  completion(.failure(.audioSessionFailure))
-@@ -171,16 +212,14 @@
+@@ -171,16 +214,14 @@
                  return
              }
              
@@ -189,7 +191,7 @@
              let mixer = AVAudioMixerNode()
              self.mixer = mixer
              audioEngine.attach(mixer)
-@@ -205,7 +244,7 @@
+@@ -205,7 +246,7 @@
              // Note: Not all Apple devices have the same default sample rate.
              if recordingFormat.sampleRate != hardwareSampleRate {
                  MXLog.info("Sample rate conversion is needed \(hardwareSampleRate) -> \(recordingFormat.sampleRate)")
@@ -198,7 +200,7 @@
              } else {
                  audioConverter = nil
              }
-@@ -285,7 +324,7 @@
+@@ -285,7 +326,7 @@
          if let audioConverter {
              // Create an AVAudioPCMBuffer instance for the converted buffer
              let conversionRatio = buffer.format.sampleRate / recordingFormat.sampleRate
@@ -207,7 +209,7 @@
              guard let convertedBuffer = AVAudioPCMBuffer(pcmFormat: recordingFormat, frameCapacity: frameCapacity) else {
                  MXLog.error("failed to initialize an output buffer")
                  return
-@@ -295,7 +334,13 @@
+@@ -295,7 +336,13 @@
              // The block type is `@Sendable` but `convert(to:error:withInputFrom:)`
              // invokes it synchronously on this same thread, the buffer never crosses.
              nonisolated(unsafe) let inputBufferForConversion = buffer
@@ -221,7 +223,7 @@
                  outStatus.pointee = AVAudioConverterInputStatus.haveData
                  return inputBufferForConversion
              }
-@@ -452,8 +497,12 @@
+@@ -452,8 +499,12 @@
          }
          
          // Compute RMS
