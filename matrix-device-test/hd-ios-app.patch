@@ -55,4 +55,43 @@
                  }
                  .accessibilityIdentifier(A11yIdentifiers.roomScreen.joinCall)
                  .disabled(!viewState.canJoinCall)
-
+--- a/ElementX/Sources/Services/NativeCall/NativeCallRoomContext.swift
++++ b/ElementX/Sources/Services/NativeCall/NativeCallRoomContext.swift
+@@ -34,12 +34,11 @@
+             .eraseToAnyPublisher()
+     }
+     
+-    var isDirect: Bool {
+-        roomProxy.infoPublisher.value.isDirect
+-    }
++    // Schat room calls stay open when a participant leaves.
++    let isDirect = false
+     
+     var isDirectPublisher: AnyPublisher<Bool, Never> {
+-        roomProxy.infoPublisher.map(\.isDirect).removeDuplicates().eraseToAnyPublisher()
++        Just(isDirect).eraseToAnyPublisher()
+     }
+     
+     var memberProfiles: [String: ElementCallMemberProfile] {
+--- a/ElementX/Sources/Services/NativeCall/NativeCallStack.swift
++++ b/ElementX/Sources/Services/NativeCall/NativeCallStack.swift
+@@ -8,6 +8,7 @@
+ import Combine
+ import ElementCall
+ import Foundation
++import OSLog
+ 
+ /// The call package's stack for one logged-in session, turning what the call does into the
+ /// navigation the host owes it.
+@@ -151,7 +152,10 @@
+             case .debug: MXLog.debug(message, file: record.file, line: record.line)
+             case .info: MXLog.info(message, file: record.file, line: record.line)
+             case .warning: MXLog.warning(message, file: record.file, line: record.line)
+-            case .error: MXLog.error(message, file: record.file, line: record.line)
++            case .error:
++                MXLog.error(message, file: record.file, line: record.line)
++                OSLog.Logger(subsystem: "win.play800.schat.matrix", category: "RoomCall")
++                    .error("Native room call failed at \(record.file, privacy: .public):\(record.line, privacy: .public)")
+             }
+         }
+     }
