@@ -27,7 +27,7 @@ def configure_ios(root):
     apply_patch(root, "ios-call-audio.patch")
     apply_patch(root, "ios-session-restore.patch")
     apply_patch(root, "ios-stereo-voice.patch")
-    replace(root, "project.yml", [("CURRENT_PROJECT_VERSION: 1", "CURRENT_PROJECT_VERSION: 3")])
+    replace(root, "project.yml", [("CURRENT_PROJECT_VERSION: 1", "CURRENT_PROJECT_VERSION: 4")])
     replace(root, "app.yml", [
         ("APP_DISPLAY_NAME: Element X", "APP_DISPLAY_NAME: Schat Matrix"),
         ("APP_GROUP_IDENTIFIER: group.io.element", "APP_GROUP_IDENTIFIER: group.win.play800.schat.matrix"),
