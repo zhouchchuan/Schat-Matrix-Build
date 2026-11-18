@@ -1,16 +1,44 @@
+diff --git a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenEvent.kt b/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenEvent.kt
+index 357559c3..d967d4b9 100644
+--- a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenEvent.kt
++++ b/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenEvent.kt
+@@ -14,4 +14,5 @@ sealed interface CallScreenEvent {
+     data object Hangup : CallScreenEvent
+     data class SetupMessageChannels(val widgetMessageInterceptor: WidgetMessageInterceptor) : CallScreenEvent
+     data class OnWebViewError(val description: String?) : CallScreenEvent
++    data class OnRendererGone(val description: String) : CallScreenEvent
+ }
+diff --git a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenPresenter.kt b/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenPresenter.kt
+index cc3468a8..21cbdaf2 100644
+--- a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenPresenter.kt
++++ b/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenPresenter.kt
+@@ -182,6 +182,11 @@ class CallScreenPresenter(
+                     }
+                     // Else ignore the error, give a chance the Element Call to recover by itself.
+                 }
++                is CallScreenEvent.OnRendererGone -> {
++                    isWidgetLoaded = false
++                    messageInterceptor.value = null
++                    webViewError = event.description
++                }
+             }
+         }
+ 
 diff --git a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenView.kt b/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenView.kt
-index 33c3024f..6b39259e 100644
+index 33c3024f..cd993d78 100644
 --- a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenView.kt
 +++ b/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/ui/CallScreenView.kt
-@@ -88,7 +88,6 @@ internal fun CallScreenView(
+@@ -88,8 +88,8 @@ internal fun CallScreenView(
              onSubmit = { state.eventSink(CallScreenEvent.Hangup) },
          )
      } else {
 -        var webViewAudioManager by remember { mutableStateOf<WebViewAudioManager?>(null) }
          val coroutineScope = rememberCoroutineScope()
++        val rendererError = stringResource(R.string.call_webview_renderer_stopped)
  
          var invalidAudioDeviceReason by remember { mutableStateOf<InvalidAudioDeviceReason?>(null) }
-@@ -111,13 +110,19 @@ internal fun CallScreenView(
+         invalidAudioDeviceReason?.let {
+@@ -111,24 +111,26 @@ internal fun CallScreenView(
              onCreateWebView = { webView ->
                  callWebView = webView
                  webView.addBackHandler(onBackPressed = ::handleBack)
@@ -32,19 +60,19 @@ index 33c3024f..6b39259e 100644
                              pipState.eventSink(PictureInPictureEvent.OnCallStarted)
                          } else {
                              Timber.d("Can't start in-call audio mode since the app is already in it.")
-@@ -125,11 +130,6 @@ internal fun CallScreenView(
+                         }
                      },
                      onError = { state.eventSink(CallScreenEvent.OnWebViewError(it)) },
-                 )
+-                )
 -                webViewAudioManager = WebViewAudioManager(
 -                    webView = webView,
 -                    coroutineScope = coroutineScope,
 -                    onInvalidAudioDeviceAdded = { invalidAudioDeviceReason = it },
--                )
++                    onRendererGone = { state.eventSink(CallScreenEvent.OnRendererGone(rendererError)) },
+                 )
                  state.eventSink(CallScreenEvent.SetupMessageChannels(interceptor))
                  val pipController = WebViewPipController(
-                     webView = webView,
-@@ -139,10 +139,9 @@ internal fun CallScreenView(
+@@ -139,10 +141,9 @@ internal fun CallScreenView(
                  )
                  pipState.eventSink(PictureInPictureEvent.SetPipController(pipController))
              },
@@ -58,7 +86,7 @@ index 33c3024f..6b39259e 100644
              }
          )
          when (state.urlState) {
-@@ -204,7 +203,9 @@ private fun CallWebView(
+@@ -204,7 +205,9 @@ private fun CallWebView(
                  }
              },
              update = { webView ->
@@ -267,6 +295,67 @@ index 32902699..088bd9eb 100644
      /**
       * Assigns the callback in the WebView to be called when the user selects an audio device.
       *
+diff --git a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/utils/WebViewWidgetMessageInterceptor.kt b/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/utils/WebViewWidgetMessageInterceptor.kt
+index db81975b..fbf85705 100644
+--- a/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/utils/WebViewWidgetMessageInterceptor.kt
++++ b/features/call/impl/src/main/kotlin/io/element/android/features/call/impl/utils/WebViewWidgetMessageInterceptor.kt
+@@ -10,13 +10,16 @@ package io.element.android.features.call.impl.utils
+ 
+ import android.graphics.Bitmap
+ import android.net.http.SslError
++import android.os.Build
+ import android.webkit.JavascriptInterface
++import android.webkit.RenderProcessGoneDetail
+ import android.webkit.SslErrorHandler
+ import android.webkit.WebResourceError
+ import android.webkit.WebResourceRequest
+ import android.webkit.WebResourceResponse
+ import android.webkit.WebView
+ import android.webkit.WebViewClient
++import androidx.annotation.RequiresApi
+ import androidx.core.net.toUri
+ import androidx.webkit.WebViewAssetLoader
+ import androidx.webkit.WebViewCompat
+@@ -29,6 +32,7 @@ class WebViewWidgetMessageInterceptor(
+     private val webView: WebView,
+     private val onUrlLoaded: (String) -> Unit,
+     private val onError: (String?) -> Unit,
++    private val onRendererGone: () -> Unit,
+ ) : WidgetMessageInterceptor {
+     companion object {
+         // We call both the WebMessageListener and the JavascriptInterface objects in JS with this
+@@ -39,6 +43,7 @@ class WebViewWidgetMessageInterceptor(
+ 
+     // It's important to have extra capacity here to make sure we don't drop any messages
+     override val interceptedMessages = MutableSharedFlow<String>(extraBufferCapacity = 10)
++    private var rendererGone = false
+ 
+     init {
+         val assetLoader = WebViewAssetLoader.Builder()
+@@ -118,6 +123,14 @@ class WebViewWidgetMessageInterceptor(
+                 onUrlLoaded(url)
+             }
+ 
++            @RequiresApi(Build.VERSION_CODES.O)
++            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
++                rendererGone = true
++                Timber.e("Call WebView renderer exited (crashed=${detail.didCrash()})")
++                onRendererGone()
++                return true
++            }
++
+             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                 // No network for instance, transmit the error
+                 Timber.e("onReceivedError error: ${error?.errorCode} ${error?.description}")
+@@ -193,7 +206,7 @@ class WebViewWidgetMessageInterceptor(
+     }
+ 
+     override fun sendMessage(message: String) {
+-        webView.evaluateJavascript("postMessage($message, '*')", null)
++        if (!rendererGone) webView.evaluateJavascript("postMessage($message, '*')", null)
+     }
+ 
+     private fun onMessageReceived(json: String?) {
 diff --git a/features/call/impl/src/main/res/values/do_not_translate.xml b/features/call/impl/src/main/res/values/do_not_translate.xml
 index deb835b3..0ddb3c7f 100644
 --- a/features/call/impl/src/main/res/values/do_not_translate.xml
@@ -279,6 +368,36 @@ index deb835b3..0ddb3c7f 100644
 +    <item name="call_widget_requested_url" type="id" />
      <string translatable="false" name="element_call">Element Call</string>
  </resources>
+diff --git a/features/call/impl/src/test/kotlin/io/element/android/features/call/impl/ui/CallScreenPresenterTest.kt b/features/call/impl/src/test/kotlin/io/element/android/features/call/impl/ui/CallScreenPresenterTest.kt
+index 28898695..7778a370 100644
+--- a/features/call/impl/src/test/kotlin/io/element/android/features/call/impl/ui/CallScreenPresenterTest.kt
++++ b/features/call/impl/src/test/kotlin/io/element/android/features/call/impl/ui/CallScreenPresenterTest.kt
+@@ -183,7 +183,7 @@ class CallScreenPresenterTest {
+     }
+ 
+     @Test
+-    fun `present - a received 'content loaded' action makes the call to be active`() = runTest {
++    fun `present - renderer failure deactivates a loaded call and shows its error`() = runTest {
+         val navigator = FakeCallScreenNavigator()
+         val widgetDriver = FakeMatrixWidgetDriver()
+         val presenter = createCallScreenPresenter(
+@@ -212,8 +212,14 @@ class CallScreenPresenterTest {
+                 """.trimIndent()
+             )
+             skipItems(2)
+-            val finalState = awaitItem()
+-            assertThat(finalState.isCallActive).isTrue()
++            val activeState = awaitItem()
++            assertThat(activeState.isCallActive).isTrue()
++
++            activeState.eventSink(CallScreenEvent.OnRendererGone("WebView stopped"))
++            runCurrent()
++            val stoppedState = expectMostRecentItem()
++            assertThat(stoppedState.isCallActive).isFalse()
++            assertThat(stoppedState.webViewError).isEqualTo("WebView stopped")
+         }
+     }
+ 
 diff --git a/libraries/mediaplayer/impl/src/main/kotlin/io/element/android/libraries/mediaplayer/impl/DefaultMediaPlayer.kt b/libraries/mediaplayer/impl/src/main/kotlin/io/element/android/libraries/mediaplayer/impl/DefaultMediaPlayer.kt
 index 12b36207..3703ee26 100644
 --- a/libraries/mediaplayer/impl/src/main/kotlin/io/element/android/libraries/mediaplayer/impl/DefaultMediaPlayer.kt
@@ -528,7 +647,7 @@ index c1e2dc97..1638e0f1 100644
 +    }
  }
 diff --git a/libraries/voiceplayer/impl/src/main/kotlin/io/element/android/libraries/voiceplayer/impl/VoiceMessagePlayer.kt b/libraries/voiceplayer/impl/src/main/kotlin/io/element/android/libraries/voiceplayer/impl/VoiceMessagePlayer.kt
-index 510b80ba..d0e414af 100644
+index 510b80ba..4838f5e2 100644
 --- a/libraries/voiceplayer/impl/src/main/kotlin/io/element/android/libraries/voiceplayer/impl/VoiceMessagePlayer.kt
 +++ b/libraries/voiceplayer/impl/src/main/kotlin/io/element/android/libraries/voiceplayer/impl/VoiceMessagePlayer.kt
 @@ -20,7 +20,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
@@ -551,7 +670,7 @@ index 510b80ba..d0e414af 100644
      filename: String?,
  ) : VoiceMessagePlayer {
      @ContributesBinding(RoomScope::class) // Scoped types can't use @Inject.
-@@ -188,13 +191,15 @@ class DefaultVoiceMessagePlayer(
+@@ -188,13 +191,16 @@ class DefaultVoiceMessagePlayer(
      }.distinctUntilChanged()
  
      override suspend fun prepare(): Result<Unit> = if (eventId != null) {
@@ -561,7 +680,9 @@ index 510b80ba..d0e414af 100644
 +        media.mapCatchingExceptions<Unit, File> { mediaFile ->
              val state = internalState.value
              mediaPlayer.setMedia(
-                 uri = mediaFile.path,
+-                uri = mediaFile.path,
++                // The cache path can include the homeserver's port. Give Media3 an explicit file URI.
++                uri = mediaFile.toURI().toASCIIString(),
                  mediaId = eventId.value,
                  // Files in the voice cache have no extension so we need to set the mime type manually.
 -                mimeType = MimeTypes.Ogg,
@@ -569,8 +690,48 @@ index 510b80ba..d0e414af 100644
                  startPositionMs = if (state.isEnded) 0L else state.currentPosition,
              )
          }
+diff --git a/libraries/voiceplayer/impl/src/test/kotlin/io/element/android/libraries/voiceplayer/impl/DefaultVoiceMessagePlayerTest.kt b/libraries/voiceplayer/impl/src/test/kotlin/io/element/android/libraries/voiceplayer/impl/DefaultVoiceMessagePlayerTest.kt
+index d4005067..c9d3b374 100644
+--- a/libraries/voiceplayer/impl/src/test/kotlin/io/element/android/libraries/voiceplayer/impl/DefaultVoiceMessagePlayerTest.kt
++++ b/libraries/voiceplayer/impl/src/test/kotlin/io/element/android/libraries/voiceplayer/impl/DefaultVoiceMessagePlayerTest.kt
+@@ -19,6 +19,8 @@ import io.element.android.libraries.mediaplayer.api.MediaPlayer
+ import io.element.android.libraries.mediaplayer.test.FakeMediaPlayer
+ import kotlinx.coroutines.test.runTest
+ import org.junit.Test
++import java.io.File
++import java.net.URI
+ 
+ class DefaultVoiceMessagePlayerTest {
+     @Test
+@@ -38,6 +40,26 @@ class DefaultVoiceMessagePlayerTest {
+         }
+     }
+ 
++    @Test
++    fun `prepare supplies a file URI for a homeserver with a port`() = runTest {
++        val cachedVoice = File("cache/voice/server.example:5289/voice note.ogg").absoluteFile
++        val repo = object : VoiceMessageMediaRepo {
++            override suspend fun getMediaFile() = Result.success(cachedVoice)
++        }
++        val delegate = FakeMediaPlayer()
++        var requestedUri: URI? = null
++        val playback = object : MediaPlayer by delegate {
++            override suspend fun setMedia(uri: String, mediaId: String, mimeType: String, startPositionMs: Long): MediaPlayer.State {
++                requestedUri = URI(uri)
++                return delegate.setMedia(uri, mediaId, mimeType, startPositionMs)
++            }
++        }
++
++        assertThat(createDefaultVoiceMessagePlayer(playback, repo).prepare().isSuccess).isTrue()
++        assertThat(requestedUri?.scheme).isEqualTo("file")
++        assertThat(File(requireNotNull(requestedUri))).isEqualTo(cachedVoice)
++    }
++
+     @Test
+     fun `prepare fails when repo fails`() = runTest {
+         val player = createDefaultVoiceMessagePlayer(
 diff --git a/plugins/src/main/kotlin/Versions.kt b/plugins/src/main/kotlin/Versions.kt
-index 91a38d69..b916b4ce 100644
+index 91a38d69..961b5b44 100644
 --- a/plugins/src/main/kotlin/Versions.kt
 +++ b/plugins/src/main/kotlin/Versions.kt
 @@ -45,7 +45,7 @@ private const val versionMonth = 11
@@ -578,7 +739,25 @@ index 91a38d69..b916b4ce 100644
   * Do not update this value. it is updated by the release script.
   */
 -private const val versionReleaseNumber = 0
-+private const val versionReleaseNumber = 1
++private const val versionReleaseNumber = 2
  
  object Versions {
      /**
+diff --git a/features/call/impl/src/main/res/values/call_errors.xml b/features/call/impl/src/main/res/values/call_errors.xml
+new file mode 100644
+--- /dev/null
++++ b/features/call/impl/src/main/res/values/call_errors.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="call_webview_renderer_stopped">Android System WebView stopped during the call. Update it to the latest version available for your device before trying again.</string>
++</resources>
+diff --git a/features/call/impl/src/main/res/values-zh/call_errors.xml b/features/call/impl/src/main/res/values-zh/call_errors.xml
+new file mode 100644
+--- /dev/null
++++ b/features/call/impl/src/main/res/values-zh/call_errors.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="call_webview_renderer_stopped">Android 系统 WebView 在通话中意外停止。请更新到此设备可用的最新版本后重试。</string>
++</resources>
